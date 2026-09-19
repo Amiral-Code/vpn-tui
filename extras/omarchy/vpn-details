@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Middle-click action: show the VPN connection details as a notification.
+VPN_NAME="${OMARCHY_VPN_NAME:-$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/vpn-tui/bar-connection" 2>/dev/null)}"
+VPN_NAME="${VPN_NAME:-$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2 == "vpn" { print $1; exit }')}"
+
+if ! nmcli -t -f NAME connection show --active 2>/dev/null | grep -qxF "$VPN_NAME"; then
+  notify-send -a VPN -i network-vpn-symbolic "${VPN_NAME:-VPN}" "Not connected"
+  exit
+fi
+
+body=$(nmcli -t connection show "$VPN_NAME" 2>/dev/null | awk -F: '
+  $1 == "IP4.ADDRESS[1]"  { print "Address: " $2 }
+  $1 == "IP4.GATEWAY"     { print "Gateway: " $2 }
+  $1 ~ /^IP4.DNS/         { print "DNS:     " $2 }')
+
+notify-send -a VPN -i network-vpn-symbolic "$VPN_NAME connected" "$body"

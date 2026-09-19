@@ -1,0 +1,1949 @@
+#!/usr/bin/env python3
+"""vpn-tui: a terminal front-end for NetworkManager's OpenVPN profiles.
+
+It covers the menu of the OpenVPN GUI tray icon on Windows: Connect,
+Disconnect, Reconnect, Show Status, View Log, Edit Config, Change / Clear
+Saved Password, Import (file or URL) and Settings. Everything goes through
+nmcli, so the bar widget and this TUI always agree about state.
+
+  vpn-tui                     open the TUI
+  vpn-tui --auth NAME         open it at the username/password prompt
+  vpn-tui --connect NAME      connect without a UI (used by "Connect at login")
+  vpn-tui --disconnect NAME
+
+https://github.com/Amiral-Code/vpn-tui · MIT license
+"""
+__version__ = "0.1.0"
+
+import argparse
+import collections
+import curses
+import glob
+import grp
+import ipaddress
+import itertools
+import json
+import locale
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser("~")
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+CONFIG_DIR = os.path.join(XDG_CONFIG, "vpn-tui")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+# Plain-text name of the profile a status-bar widget toggles; read by the
+# optional bar scripts in extras/.
+BAR_FILE = os.path.join(CONFIG_DIR, "bar-connection")
+AUTOSTART_DIR = os.path.join(XDG_CONFIG, "autostart")
+SELF = os.path.realpath(__file__)
+
+# nmcli's field names are stable, but values and messages are translated.
+NM_ENV = dict(os.environ, LC_ALL="C.UTF-8")
+
+
+# ── nmcli and system helpers ─────────────────────────────────────────────────
+
+def run(cmd, input=None, timeout=120, env=None):
+    try:
+        p = subprocess.run(cmd, input=input, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+
+
+def nmcli(*args, **kw):
+    return run(["nmcli", *args], env=NM_ENV, **kw)
+
+
+def nm_error(out, err):
+    """The useful part of an nmcli failure, without prefixes and hints."""
+    lines = [l for l in (err or out).splitlines()
+             if l.strip() and not l.startswith(("Hint:", "Warning:", "You need to"))]
+    msg = lines[-1] if lines else "unknown error"
+    msg = re.sub(r"^Error:\s*", "", msg)
+    return re.sub(r"^Connection activation failed:\s*", "", msg)
+
+
+def split_terse(line):
+    """Split an `nmcli -t` line on unescaped colons."""
+    out, cur, esc = [], [], False
+    for ch in line:
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return out
+
+
+def list_vpns():
+    rc, out, _ = nmcli("-t", "-f", "NAME,UUID,TYPE,STATE,ACTIVE-PATH", "connection", "show")
+    rows = []
+    for line in out.splitlines():
+        f = split_terse(line)
+        if len(f) >= 5 and f[2] == "vpn":
+            rows.append({"name": f[0], "uuid": f[1], "state": f[3], "path": f[4]})
+    return rows
+
+
+def show_conn(uuid):
+    """All properties of a profile (plus live IP4.* data when active)."""
+    rc, out, _ = nmcli("-s", "connection", "show", "uuid", uuid)
+    if rc:
+        return None
+    info = {}
+    for line in out.splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            v = v.strip()
+            info[k.strip()] = "" if v == "--" else v
+    return info
+
+
+def parse_kv_list(s):
+    """'a = 1, b = x\\, y' (vpn.data / vpn.secrets) → {'a': '1', 'b': 'x, y'}."""
+    out, last = {}, None
+    for part in re.split(r"(?<!\\), ", s or ""):
+        part = part.replace("\\,", ",")
+        k, sep, v = part.partition(" = ")
+        if sep:
+            last = k.strip()
+            out[last] = v.strip()
+        elif last:
+            out[last] += ", " + part
+    return out
+
+
+def iface_for(addr):
+    rc, out, _ = run(["ip", "-j", "-4", "addr", "show"], timeout=5)
+    try:
+        for link in json.loads(out or "[]"):
+            for a in link.get("addr_info", []):
+                if a.get("local") == addr:
+                    return link.get("ifname", "")
+    except ValueError:
+        pass
+    return ""
+
+
+def resolved_link(iface):
+    """(dns servers, routing domains) systemd-resolved has on a link.
+
+    None when resolvectl is missing or resolved is not running, so callers can
+    skip the check instead of reporting DNS as broken.
+    """
+    if not iface or not shutil.which("resolvectl"):
+        return None, None
+
+    def tail(s):
+        first = s.splitlines()[0] if s.strip() else ""
+        return first.split(":", 1)[1].split() if ":" in first else []
+
+    rc, dns, _ = run(["resolvectl", "dns", iface], timeout=5)
+    if rc:
+        return None, None
+    _, dom, _ = run(["resolvectl", "domain", iface], timeout=5)
+    return tail(dns), tail(dom)
+
+
+def openvpn_pid(active_path):
+    """PID of the openvpn process NM started for an active connection.
+
+    nm-openvpn embeds the active connection's D-Bus index in openvpn's --up
+    helper command ("--bus-name ...openvpn.Connection_<N>"), which ties the
+    process to the profile.
+    """
+    n = (active_path or "").rsplit("/", 1)[-1]
+    if not n.isdigit():
+        return 0
+    needle = re.compile(rb"NetworkManager\.openvpn\.Connection_%s(?!\d)" % n.encode())
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        if raw.split(b"\0", 1)[0].endswith(b"openvpn") and needle.search(raw):
+            return int(pid)
+    return 0
+
+
+def proc_start(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/stat") as f:
+            btime = next(int(l.split()[1]) for l in f if l.startswith("btime"))
+        return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return 0
+
+
+def read_counter(iface, name):
+    try:
+        with open(f"/sys/class/net/{iface}/statistics/{name}") as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return 0
+
+
+def journal_readable():
+    """Reading other units' logs needs root or one of these groups."""
+    if os.geteuid() == 0:
+        return True
+    names = set()
+    for g in os.getgroups():
+        try:
+            names.add(grp.getgrgid(g).gr_name)
+        except KeyError:
+            pass
+    return bool(names & {"systemd-journal", "adm", "wheel"})
+
+
+def copy_to_clipboard(text):
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+        if shutil.which(cmd[0]):
+            return run(cmd, input=text, timeout=5)[0] == 0
+    return False
+
+
+def notify(title, body=""):
+    if shutil.which("notify-send"):
+        run(["notify-send", "-a", "VPN", "-i", "network-vpn-symbolic", title, body], timeout=5)
+
+
+# ── settings, bar widget, login autostart ────────────────────────────────────
+
+def load_config():
+    cfg = {"notify": True}
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def bar_connection():
+    try:
+        with open(BAR_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return os.environ.get("OMARCHY_VPN_NAME", "")
+
+
+def set_bar_connection(name):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(BAR_FILE, "w") as f:
+        f.write(name + "\n")
+
+
+def autostart_path(uuid):
+    return os.path.join(AUTOSTART_DIR, f"vpn-tui-{uuid}.desktop")
+
+
+def autostart_enabled(uuid):
+    return os.path.exists(autostart_path(uuid))
+
+
+def set_autostart(uuid, name, on):
+    path = autostart_path(uuid)
+    if not on:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    os.makedirs(AUTOSTART_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        f.write("[Desktop Entry]\n"
+                "Type=Application\n"
+                f"Name=VPN: {name}\n"
+                f"Comment=Connect {name} at login (managed by vpn-tui)\n"
+                f"Exec={SELF} --connect {uuid}\n"
+                "NoDisplay=true\n")
+
+
+# ── formatting ───────────────────────────────────────────────────────────────
+
+def human_bytes(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def human_duration(s):
+    s = int(max(0, s))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def ago(ts):
+    if not ts:
+        return ""
+    s = time.time() - ts
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{int(s // 60)} min ago"
+    if s < 86400:
+        return f"{int(s // 3600)} h ago"
+    if s < 7 * 86400:
+        return f"{int(s // 86400)} days ago"
+    return time.strftime("%d %b %Y", time.localtime(ts))
+
+
+def remotes(data):
+    """[(host, port, proto)] from vpn.data 'remote' (space/comma separated)."""
+    out = []
+    for tok in re.split(r"[\s,]+", data.get("remote", "")):
+        if tok:
+            parts = tok.split(":")
+            out.append((parts[0], parts[1] if len(parts) > 1 else data.get("port", "1194"),
+                        parts[2] if len(parts) > 2 else ("tcp" if data.get("proto-tcp") == "yes" else "udp")))
+    return out
+
+
+def is_private_host(host):
+    try:
+        return ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False
+
+
+# ── journal ──────────────────────────────────────────────────────────────────
+
+NM_PREFIX = re.compile(r"^<(\w+)>\s+\[[\d.]+\]\s+(?:vpn\[[^\]]*\]:\s*)?")
+OK_RE = re.compile(r"Initialization Sequence Completed|Peer Connection Initiated")
+ERR_RE = re.compile(r"AUTH_FAILED|\berror\b|failed|fatal|cannot|can't|refused|unreachable|timed? ?out", re.I)
+WARN_RE = re.compile(r"WARNING|SIGUSR1|SIGHUP|restart|DEPRECATED|Unrecognized option", re.I)
+
+
+def classify(msg):
+    if OK_RE.search(msg):
+        return "ok"
+    if msg.startswith("SIGTERM"):
+        return "info"
+    if WARN_RE.search(msg):
+        return "warn"
+    if ERR_RE.search(msg):
+        return "err"
+    return "info"
+
+
+class Logs:
+    """Follows the journal for OpenVPN and for NetworkManager's per-profile lines.
+
+    NetworkManager tags its own lines with NM_CONNECTION=<uuid>, but openvpn
+    logs as plain `nm-openvpn[pid]`. A pid is attributed to the profile whose
+    "starting openvpn" line came just before that pid first spoke.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.lock = threading.Lock()
+        self.by_uuid = collections.defaultdict(lambda: collections.deque(maxlen=4000))
+        self.all = collections.deque(maxlen=8000)
+        self.version = 0
+        self.gen = 0
+        self.uuids = None
+        self.proc = None
+        self.error = "" if journal_readable() else \
+            "Can't read the system journal. Add yourself to the systemd-journal group and log in again."
+        self.pid_owner = {}
+        self.pending = []
+
+    def ensure(self, uuids):
+        uuids = frozenset(uuids)
+        alive = self.proc is not None and self.proc.poll() is None
+        if uuids == self.uuids and alive:
+            return
+        self.stop()
+        with self.lock:
+            self.gen += 1
+            self.uuids = uuids
+            self.by_uuid.clear()
+            self.all.clear()
+            self.pid_owner.clear()
+            self.pending = []
+            self.version += 1
+        args = ["journalctl", "-f", "-o", "json", "-n", "3000", "--no-pager",
+                "--output-fields=MESSAGE,SYSLOG_IDENTIFIER,_PID,NM_CONNECTION,_BOOT_ID"]
+        for u in sorted(uuids):
+            args.append(f"NM_CONNECTION={u}")
+        if uuids:
+            args.append("+")
+        args.append("SYSLOG_IDENTIFIER=nm-openvpn")
+        try:
+            self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         text=True, errors="replace")
+        except OSError as e:
+            self.error = str(e)
+            return
+        threading.Thread(target=self._follow, args=(self.proc, self.gen), daemon=True).start()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+        self.proc = None
+
+    def _follow(self, proc, gen):
+        for line in proc.stdout:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            with self.lock:
+                if gen != self.gen:
+                    return
+                self._ingest(e)
+        err = proc.stderr.read().strip() if proc.stderr else ""
+        if err and gen == self.gen:
+            self.error = err.splitlines()[-1]
+
+    def _ingest(self, e):
+        msg = e.get("MESSAGE")
+        if isinstance(msg, list):
+            msg = bytes(msg).decode("utf-8", "replace")
+        if not isinstance(msg, str):
+            return
+        ts = int(e.get("__REALTIME_TIMESTAMP", 0)) / 1e6
+        if e.get("SYSLOG_IDENTIFIER") == "nm-openvpn":
+            pid = int(e.get("_PID") or 0)
+            key = (e.get("_BOOT_ID"), pid)
+            if key not in self.pid_owner:
+                self.pid_owner[key] = self._claim(pid, ts)
+            owner = self.pid_owner[key]
+            entry = (ts, pid, classify(msg), msg)
+        else:
+            owner = e.get("NM_CONNECTION")
+            m = NM_PREFIX.match(msg)
+            level = {"warn": "warn", "error": "err"}.get(m.group(1) if m else "", "info")
+            text = NM_PREFIX.sub("", msg)
+            if text.startswith("starting "):
+                self.pending = [p for p in self.pending if p[0] != owner] + [(owner, ts)]
+            entry = (ts, 0, level, "NetworkManager: " + text)
+        self.all.append(entry)
+        if owner:
+            self.by_uuid[owner].append(entry)
+        self.version += 1
+
+    def _claim(self, pid, ts):
+        self.pending = [p for p in self.pending if ts - p[1] < 180]
+        if self.pending:
+            return self.pending.pop(0)[0]
+        owner = self.model.owner_of_pid(pid)
+        if owner:
+            return owner
+        return next(iter(self.uuids)) if len(self.uuids) == 1 else None
+
+    def entries(self, uuid=None, last=None):
+        with self.lock:
+            dq = self.all if uuid is None else self.by_uuid.get(uuid, ())
+            if last is None:
+                return list(dq)
+            return list(itertools.islice(reversed(dq), last))[::-1]
+
+    def since(self, uuid, t0, pattern):
+        with self.lock:
+            return any(ts >= t0 and pattern in msg for ts, _, _, msg in self.by_uuid.get(uuid, ()))
+
+    def connected_at(self, uuid, pid):
+        with self.lock:
+            for ts, p, _, msg in reversed(self.by_uuid.get(uuid, ())):
+                if p == pid and "Initialization Sequence Completed" in msg:
+                    return ts
+        return 0
+
+
+# ── model ────────────────────────────────────────────────────────────────────
+
+class Conn:
+    def __init__(self, uuid, name):
+        self.uuid, self.name = uuid, name
+        self.state = None           # activated / activating / deactivating / "" (off)
+        self.path = ""              # active-connection D-Bus path
+        self.info, self.data = {}, {}
+        self.fetched, self.fetched_state = 0.0, None
+        self.iface = self.iface_addr = ""
+        self.rx = self.tx = 0
+        self.rx_rate = self.tx_rate = 0.0
+        self.sample_t = 0.0
+        self.dns_live, self.dns_domains, self.dns_t = None, None, 0.0
+        self.pid = 0
+        self.busy = ""              # set while this TUI runs an action on it
+        self.last_op = 0.0
+
+    @property
+    def active(self):
+        return self.state == "activated"
+
+    @property
+    def secrets(self):
+        return parse_kv_list(self.info.get("vpn.secrets", ""))
+
+    @property
+    def uses_password(self):
+        return self.data.get("connection-type", "tls") in ("password", "password-tls")
+
+    @property
+    def password_state(self):
+        """saved / ask / agent / missing / n/a."""
+        if not self.uses_password:
+            return "n/a"
+        flags = self.data.get("password-flags", "0")
+        if flags == "0":
+            return "saved" if "password" in self.secrets else "missing"
+        if flags == "1":
+            return "agent"
+        return "ask"
+
+
+class Model:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.conns = {}
+        self.order = []
+        self.events = queue.Queue()
+        self.logs = Logs(self)
+        self.dirty = set()
+        self.wake = threading.Event()
+        self.stopped = threading.Event()
+        self.first = True
+
+    def snapshot(self):
+        with self.lock:
+            return [self.conns[u] for u in self.order if u in self.conns]
+
+    def get(self, uuid):
+        with self.lock:
+            return self.conns.get(uuid)
+
+    def owner_of_pid(self, pid):
+        with self.lock:
+            conns = list(self.conns.values())
+        for c in conns:
+            if c.state and (c.pid == pid or openvpn_pid(c.path) == pid):
+                return c.uuid
+        return None
+
+    def refresh(self, uuid=None):
+        if uuid:
+            self.dirty.add(uuid)
+        self.wake.set()
+
+    def run(self):
+        while not self.stopped.is_set():
+            try:
+                self.poll()
+            except Exception as e:  # keep polling; show why
+                self.events.put(("error", f"refresh failed: {e}"))
+            self.wake.wait(1.0)
+            self.wake.clear()
+
+    def poll(self):
+        now = time.time()
+        rows = list_vpns()
+        seen = set()
+        for r in rows:
+            u = r["uuid"]
+            seen.add(u)
+            with self.lock:
+                c = self.conns.get(u)
+                if c is None:
+                    c = self.conns[u] = Conn(u, r["name"])
+                prev = c.state
+                c.name, c.state, c.path = r["name"], r["state"], r["path"]
+            if not self.first and prev is not None and prev != c.state:
+                self.state_changed(c, prev)
+            stale = now - c.fetched > (3 if c.state else 30)
+            if c.fetched_state != c.state or stale or u in self.dirty:
+                self.dirty.discard(u)
+                info = show_conn(u)
+                if info is not None:
+                    if c.state in ("activating", "deactivating") and not info.get("vpn.secrets"):
+                        # NM hides secrets mid-activation; keep showing the last known ones.
+                        info["vpn.secrets"] = c.info.get("vpn.secrets", "")
+                    with self.lock:
+                        c.info, c.data = info, parse_kv_list(info.get("vpn.data"))
+                        c.fetched, c.fetched_state = now, c.state
+            if c.state:
+                self.sample(c, now)
+            else:
+                c.iface = c.iface_addr = ""
+                c.pid, c.sample_t, c.rx_rate, c.tx_rate = 0, 0.0, 0.0, 0.0
+                c.dns_live, c.dns_domains = None, None
+        with self.lock:
+            for u in list(self.conns):
+                if u not in seen:
+                    del self.conns[u]
+            self.order = sorted(self.conns, key=lambda u: self.conns[u].name.lower())
+        self.first = False
+        self.logs.ensure(seen)
+
+    def state_changed(self, c, prev):
+        if c.busy or time.time() - c.last_op < 5:
+            return  # the action's own result reports this
+        if c.state == "activated":
+            self.events.put(("ok", f"{c.name} connected"))
+        elif prev == "activated" and not c.state:
+            self.events.put(("warn", f"{c.name} disconnected"))
+
+    def sample(self, c, now):
+        if c.pid and not os.path.exists(f"/proc/{c.pid}"):
+            c.pid = 0
+        if not c.pid:
+            c.pid = openvpn_pid(c.path)
+        if not c.active:
+            return
+        addr = c.info.get("IP4.ADDRESS[1]", "").split("/")[0]
+        if addr and addr != c.iface_addr:
+            c.iface, c.iface_addr = iface_for(addr), addr
+            c.sample_t, c.dns_t = 0.0, 0.0
+        if not c.iface:
+            return
+        rx, tx = read_counter(c.iface, "rx_bytes"), read_counter(c.iface, "tx_bytes")
+        if c.sample_t:
+            dt = max(now - c.sample_t, 0.001)
+            c.rx_rate, c.tx_rate = max(0, rx - c.rx) / dt, max(0, tx - c.tx) / dt
+        c.rx, c.tx, c.sample_t = rx, tx, now
+        if now - c.dns_t > 5:
+            c.dns_live, c.dns_domains = resolved_link(c.iface)
+            c.dns_t = now
+
+
+# ── curses drawing helpers ───────────────────────────────────────────────────
+
+C = {}
+
+
+def init_colors():
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    names = [("ok", curses.COLOR_GREEN), ("warn", curses.COLOR_YELLOW), ("err", curses.COLOR_RED),
+             ("acc", curses.COLOR_CYAN), ("blue", curses.COLOR_BLUE), ("mag", curses.COLOR_MAGENTA)]
+    for i, (name, color) in enumerate(names, 1):
+        curses.init_pair(i, color, bg)
+        C[name] = curses.color_pair(i)
+    C["dim"] = curses.A_DIM
+    C["info"] = 0
+    C["bold"] = curses.A_BOLD
+
+
+def put(scr, y, x, text, attr=0, width=None):
+    h, w = scr.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return 0
+    room = w - x if width is None else min(width, w - x)
+    if room <= 0:
+        return 0
+    s = text[:room]
+    try:
+        scr.addstr(y, x, s, attr)
+    except curses.error:
+        pass  # writing the last cell of the screen raises after drawing it
+    return len(s)
+
+
+def puts(scr, y, x, parts, width):
+    for text, attr in parts:
+        if width <= 0:
+            break
+        n = put(scr, y, x, text, attr, width)
+        x += n
+        width -= n
+    return x
+
+
+def box(scr, y, x, h, w, title="", attr=0, fill=False):
+    if h < 2 or w < 4:
+        return
+    line = C["dim"] | attr
+    put(scr, y, x, "╭" + "─" * (w - 2) + "╮", line)
+    for i in range(1, h - 1):
+        put(scr, y + i, x, "│", line)
+        if fill:
+            put(scr, y + i, x + 1, " " * (w - 2))
+        put(scr, y + i, x + w - 1, "│", line)
+    put(scr, y + h - 1, x, "╰" + "─" * (w - 2) + "╯", line)
+    if title:
+        put(scr, y, x + 2, f" {title} ", C["acc"] | curses.A_BOLD, w - 4)
+
+
+def wrap(text, width):
+    if width <= 0:
+        return [text]
+    out = []
+    while len(text) > width:
+        cut = text.rfind(" ", 0, width + 1)
+        if cut <= width // 3:
+            cut = width
+        out.append(text[:cut])
+        text = text[cut:].lstrip(" ")
+    out.append(text)
+    return out
+
+
+SPIN = "◐◓◑◒"
+BACKSPACE = (curses.KEY_BACKSPACE, "\x7f", "\x08")
+ENTER = ("\n", "\r", curses.KEY_ENTER)
+ESC = "\x1b"
+
+
+def spinner():
+    return SPIN[int(time.time() * 4) % len(SPIN)]
+
+
+# ── widgets ──────────────────────────────────────────────────────────────────
+
+class LineEdit:
+    def __init__(self, text="", mask=False, paths=False):
+        self.text, self.pos, self.mask, self.paths, self.scroll = text, len(text), mask, paths, 0
+
+    def key(self, k):
+        t, p = self.text, self.pos
+        if isinstance(k, str) and len(k) == 1 and k.isprintable():
+            self.text, self.pos = t[:p] + k + t[p:], p + 1
+        elif k in BACKSPACE:
+            if p:
+                self.text, self.pos = t[:p - 1] + t[p:], p - 1
+        elif k == curses.KEY_DC:
+            self.text = t[:p] + t[p + 1:]
+        elif k == curses.KEY_LEFT:
+            self.pos = max(0, p - 1)
+        elif k == curses.KEY_RIGHT:
+            self.pos = min(len(t), p + 1)
+        elif k in (curses.KEY_HOME, "\x01"):
+            self.pos = 0
+        elif k in (curses.KEY_END, "\x05"):
+            self.pos = len(t)
+        elif k == "\x15":  # ^U
+            self.text, self.pos = t[p:], 0
+        elif k == "\x0b":  # ^K
+            self.text = t[:p]
+        elif k == "\x17":  # ^W
+            q = p
+            while q and t[q - 1] == " ":
+                q -= 1
+            while q and t[q - 1] not in " /":
+                q -= 1
+            self.text, self.pos = t[:q] + t[p:], q
+        elif k == "\t" and self.paths:
+            self.complete()
+        else:
+            return False
+        return True
+
+    def complete(self):
+        raw = self.text[:self.pos]
+        matches = sorted(glob.glob(glob.escape(os.path.expanduser(raw)) + "*"))
+        if not matches:
+            return
+        common = os.path.commonprefix(matches)
+        if len(matches) == 1 and os.path.isdir(common):
+            common += "/"
+        if raw.startswith("~") and common.startswith(HOME):
+            common = "~" + common[len(HOME):]
+        self.text, self.pos = common + self.text[self.pos:], len(common)
+
+    def render(self, scr, y, x, width, attr, focused):
+        shown = "•" * len(self.text) if self.mask else self.text
+        if self.pos < self.scroll:
+            self.scroll = self.pos
+        if self.pos - self.scroll >= width:
+            self.scroll = self.pos - width + 1
+        vis = shown[self.scroll:self.scroll + width].ljust(width)
+        put(scr, y, x, vis, attr)
+        if focused:
+            cx = self.pos - self.scroll
+            put(scr, y, x + cx, vis[cx] if cx < len(vis) else " ", attr | curses.A_REVERSE)
+
+
+class Field:
+    """One row of a Form: text, password, path, bool, choice or button."""
+
+    def __init__(self, key, label, kind="text", value="", choices=None, hint="", show_if=None):
+        self.key, self.label, self.kind, self.hint, self.show_if = key, label, kind, hint, show_if
+        self.value = value
+        self.choices = choices or []
+        self.edit = None
+        if kind in ("text", "password", "path"):
+            self.edit = LineEdit(str(value), mask=kind == "password", paths=kind == "path")
+
+    @property
+    def val(self):
+        return self.edit.text if self.edit else self.value
+
+    def display_choice(self):
+        for v, label in self.choices:
+            if v == self.value:
+                return label
+        return str(self.value)
+
+    def cycle(self, step):
+        vals = [v for v, _ in self.choices]
+        if vals:
+            i = vals.index(self.value) if self.value in vals else 0
+            self.value = vals[(i + step) % len(vals)]
+
+
+# ── the app ──────────────────────────────────────────────────────────────────
+
+class App:
+    def __init__(self, scr, model, args):
+        self.scr, self.m = scr, model
+        self.cfg = load_config()
+        self.sel_uuid = None
+        self.flash_msg = ("", 0, 0.0)
+        self.deferred = []
+        self.start_auth = args.auth
+
+    # selection ---------------------------------------------------------------
+    def conns(self):
+        return self.m.snapshot()
+
+    def current(self):
+        conns = self.conns()
+        for c in conns:
+            if c.uuid == self.sel_uuid:
+                return c
+        if conns:
+            # Start on a connected profile, since that is what you came to look at.
+            c = next((x for x in conns if x.state), conns[0])
+            self.sel_uuid = c.uuid
+            return c
+        return None
+
+    def move(self, step):
+        conns = self.conns()
+        if not conns:
+            return
+        uuids = [c.uuid for c in conns]
+        i = uuids.index(self.sel_uuid) if self.sel_uuid in uuids else 0
+        self.sel_uuid = uuids[max(0, min(len(uuids) - 1, i + step))]
+
+    def find(self, target):
+        for c in self.conns():
+            if target in (c.uuid, c.name):
+                return c
+        return None
+
+    # messages ----------------------------------------------------------------
+    def flash(self, text, level="info", secs=6):
+        self.flash_msg = (text, level, time.time() + secs)
+
+    def handle_events(self, modal=False):
+        while True:
+            try:
+                kind, payload = self.m.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "auth":
+                self.deferred.append(payload)
+            else:
+                self.flash(payload, kind)
+        if not modal and self.deferred:
+            uuid, reason = self.deferred.pop(0)
+            c = self.m.get(uuid)
+            if c:
+                self.sel_uuid = uuid
+                self.credentials(c, reason)
+
+    # keys --------------------------------------------------------------------
+    def getkey(self):
+        try:
+            return self.scr.get_wch()
+        except curses.error:
+            return None
+        except KeyboardInterrupt:
+            return "q"
+
+    # drawing -----------------------------------------------------------------
+    def draw(self, body=None, hints=None, overlay=None):
+        s = self.scr
+        s.erase()
+        H, W = s.getmaxyx()
+        if H < 12 or W < 50:
+            put(s, 0, 0, "Window too small for vpn-tui", C["warn"])
+            s.refresh()
+            return
+        self.draw_header(W)
+        (body or self.draw_main)(1, 0, H - 3, W)
+        text, level, until = self.flash_msg
+        if text and time.time() < until:
+            icon = {"ok": "✓ ", "err": "✗ ", "warn": "! "}.get(level, "")
+            put(s, H - 2, 1, icon + text, C.get(level, 0), W - 2)
+        self.draw_hints(H - 1, W, hints or self.main_hints())
+        if overlay:
+            overlay()
+        s.refresh()
+
+    def draw_header(self, W):
+        s = self.scr
+        put(s, 0, 1, "OpenVPN", C["acc"] | curses.A_BOLD)
+        active = [c for c in self.conns() if c.active]
+        if active:
+            c = active[0]
+            ip = c.info.get("IP4.ADDRESS[1]", "").split("/")[0]
+            more = f" +{len(active) - 1}" if len(active) > 1 else ""
+            text = f"● {c.name}{more}  {ip}"
+            put(s, 0, max(1, W - len(text) - 2), text, C["ok"])
+        else:
+            text = "○ not connected"
+            put(s, 0, max(1, W - len(text) - 2), text, C["dim"])
+
+    def draw_hints(self, y, W, hints):
+        x = 1
+        for key, label in hints:
+            need = len(key) + len(label) + 3
+            if x + need > W - 1:
+                break
+            x += put(self.scr, y, x, key, C["acc"] | curses.A_BOLD)
+            x += put(self.scr, y, x, " " + label + "  ", C["dim"])
+
+    def main_hints(self):
+        c = self.current()
+        toggle = "disconnect" if c and c.state in ("activated", "activating") else "connect"
+        return [("⏎", toggle), ("r", "reconnect"), ("l", "log"), ("e", "edit"), ("p", "password"),
+                ("i", "import"), ("m", "menu"), ("?", "help"), ("q", "quit")]
+
+    def draw_main(self, top, left, height, width):
+        s = self.scr
+        conns = self.conns()
+        c = self.current()
+        names = max([len(x.name) for x in conns] + [12])
+        if width >= 84:
+            lw = min(max(names + 8, 24), 34)
+            self.draw_list(top, left, height, lw, conns)
+            rx, rw, rtop, rh = left + lw, width - lw, top, height
+        else:
+            lh = min(len(conns) + 2, 7)
+            self.draw_list(top, left, lh, width, conns)
+            rx, rw, rtop, rh = left, width, top + lh, height - lh
+        if not c:
+            box(s, rtop, rx, rh, rw, "Status")
+            put(s, rtop + 2, rx + 3, "No VPN profiles yet.", C["dim"])
+            puts(s, rtop + 3, rx + 3, [("Press ", C["dim"]), ("i", C["acc"] | curses.A_BOLD),
+                                       (" to import an .ovpn file.", C["dim"])], rw - 6)
+            return
+        lines = self.status_lines(c, rw - 4)
+        sh = min(len(lines) + 2, max(rh - 5, 4))
+        box(s, rtop, rx, sh, rw, c.name)
+        for i, parts in enumerate(lines[:sh - 2]):
+            puts(s, rtop + 1 + i, rx + 2, parts, rw - 4)
+        lh = rh - sh
+        if lh >= 3:
+            box(s, rtop + sh, rx, lh, rw, "Log")
+            put(s, rtop + sh, rx + rw - 16, " l: full log ", C["dim"])
+            entries = self.m.logs.entries(c.uuid, last=lh - 2)
+            if not entries:
+                msg = self.m.logs.error or "No log lines for this profile yet."
+                put(s, rtop + sh + 1, rx + 2, msg, C["dim"], rw - 4)
+            for i, (ts, _, level, msg) in enumerate(entries):
+                y = rtop + sh + 1 + i
+                x = rx + 2 + put(s, y, rx + 2, time.strftime("%H:%M:%S ", time.localtime(ts)), C["dim"])
+                put(s, y, x, msg, C.get(level, 0), rw - (x - rx) - 2)
+
+    def draw_list(self, top, left, height, width, conns):
+        s = self.scr
+        box(s, top, left, height, width, "Connections")
+        bar = bar_connection()
+        rows = height - 2
+        uuids = [c.uuid for c in conns]
+        i = uuids.index(self.sel_uuid) if self.sel_uuid in uuids else 0
+        first = max(0, min(i - rows + 1, len(conns) - rows)) if i >= rows else 0
+        for n, c in enumerate(conns[first:first + rows]):
+            y = top + 1 + n
+            icon, attr = self.state_icon(c)
+            sel = c.uuid == self.sel_uuid
+            base = curses.A_REVERSE if sel else 0
+            put(s, y, left + 1, " " * (width - 2), base)
+            put(s, y, left + 2, icon, attr | base)
+            put(s, y, left + 4, c.name, base | (curses.A_BOLD if sel else 0), width - 8)
+            if c.name == bar:
+                put(s, y, left + width - 3, "★", C["warn"] | base)
+        if not conns:
+            put(s, top + 1, left + 2, "(none)", C["dim"])
+
+    def state_icon(self, c):
+        if c.busy or c.state in ("activating", "deactivating"):
+            return spinner(), C["warn"]
+        if c.active:
+            return "●", C["ok"]
+        return "○", C["dim"]
+
+    def status_lines(self, c, width):
+        L = []
+        dim, lab = C["dim"], C["dim"]
+
+        def row(label, *parts):
+            L.append([(f"{label:<11}", lab)] + list(parts))
+
+        # state
+        if c.busy:
+            row("Status", (f"{spinner()} {c.busy}", C["warn"] | curses.A_BOLD))
+        elif c.state == "activating":
+            row("Status", (f"{spinner()} Connecting…", C["warn"] | curses.A_BOLD))
+        elif c.state == "deactivating":
+            row("Status", (f"{spinner()} Disconnecting…", C["warn"] | curses.A_BOLD))
+        elif c.active:
+            since = self.m.logs.connected_at(c.uuid, c.pid) if c.pid else 0
+            since = since or (proc_start(c.pid) if c.pid else 0)
+            extra = [(f"  for {human_duration(time.time() - since)}", 0),
+                     (time.strftime("  since %H:%M", time.localtime(since)), dim)] if since else []
+            row("Status", ("● Connected", C["ok"] | curses.A_BOLD), *extra)
+        else:
+            last = ago(int(c.info.get("connection.timestamp") or 0))
+            row("Status", ("○ Disconnected", dim), (f"  · last connected {last}" if last else "", dim))
+
+        # server
+        rs = remotes(c.data)
+        if rs:
+            host, port, proto = rs[0]
+            parts = [(f"{host}:{port}", 0), (f"  {proto}", dim)]
+            if len(rs) > 1:
+                parts.append((f"  +{len(rs) - 1} more", dim))
+            if is_private_host(host):
+                parts.append(("  ⚠ LAN address, unreachable from outside", C["warn"]))
+            row("Server", *parts)
+        elif c.info.get("vpn.service-type") and "openvpn" not in c.info.get("vpn.service-type"):
+            row("Type", (c.info["vpn.service-type"].rsplit(".", 1)[-1], 0))
+
+        if c.active:
+            ip = c.info.get("IP4.ADDRESS[1]", "")
+            gw = c.info.get("IP4.GATEWAY", "")
+            parts = [(ip.split("/")[0], C["bold"])]
+            if gw:
+                parts.append((f"  gateway {gw}", dim))
+            if c.iface:
+                parts.append((f"  on {c.iface}", dim))
+            row("Address", *parts)
+            row("Traffic", ("↓ ", C["ok"]), (human_bytes(c.rx), 0), (f"  {human_bytes(c.rx_rate)}/s", dim),
+                ("    ↑ ", C["blue"]), (human_bytes(c.tx), 0), (f"  {human_bytes(c.tx_rate)}/s", dim))
+            nets, default = [], False
+            for k, v in c.info.items():
+                if k.startswith("IP4.ROUTE["):
+                    dst = parse_kv_list(v).get("dst", "")
+                    if dst == "0.0.0.0/0":
+                        default = True
+                    elif dst and not dst.endswith("/32"):
+                        nets.append(dst)
+            row("Routing", ("All traffic goes through the VPN", C["mag"]) if default
+                else ("Split tunnel, only the VPN's networks", 0))
+            if nets:
+                row("Networks", ("  ".join(nets), 0))
+            servers = [v for k, v in c.info.items() if k.startswith("IP4.DNS[")]
+            domains = [v for k, v in c.info.items() if k.startswith("IP4.DOMAIN[")]
+            if servers:
+                parts = [(" ".join(servers), 0)]
+                if domains:
+                    parts.append((f"  for {' '.join(domains)}", dim))
+                if c.dns_live is None:
+                    pass  # no systemd-resolved to ask
+                elif set(servers) <= set(c.dns_live):
+                    parts.append(("  ✓ active", C["ok"]))
+                elif c.iface and c.dns_t:
+                    parts.append(("  ⚠ not applied by systemd-resolved", C["warn"]))
+                row("DNS", *parts)
+        else:
+            never = c.info.get("ipv4.never-default") == "yes"
+            row("Routing", ("Split tunnel, only the VPN's networks", 0) if never
+                else ("All traffic, when the server asks for it", 0))
+
+        # account
+        if c.uses_password:
+            pw = {"saved": ("password saved", C["ok"]), "ask": ("asks for the password each time", dim),
+                  "agent": ("password kept by a keyring agent", dim),
+                  "missing": ("no password saved", C["warn"])}[c.password_state]
+            row("Account", (c.info.get("vpn.user-name") or "(no username)", 0), ("  · ", dim), pw)
+        else:
+            row("Account", ("certificate only", dim))
+
+        opts = [("auto-reconnect " + ("on" if c.info.get("vpn.persistent") == "yes" else "off"), dim),
+                ("  · at login " + ("on" if autostart_enabled(c.uuid) else "off"), dim)]
+        if c.name == bar_connection():
+            opts.append(("  · ★ bar widget", C["warn"]))
+        row("Options", *opts)
+        return L
+
+    # modal plumbing ----------------------------------------------------------
+    def modal(self, draw_fn, key_fn, body=None, hints=None):
+        while True:
+            self.handle_events(modal=True)
+            self.draw(body=body, hints=hints, overlay=draw_fn)
+            k = self.getkey()
+            if k is None or k == curses.KEY_RESIZE:
+                continue
+            r = key_fn(k)
+            if r is not None:
+                return r
+
+    def dialog_box(self, h, w, title, danger=False):
+        H, W = self.scr.getmaxyx()
+        w = min(w, W - 2)
+        h = min(h, H - 2)
+        y, x = max(0, (H - h) // 2), max(0, (W - w) // 2)
+        box(self.scr, y, x, h, w, title, C["err"] if danger else 0, fill=True)
+        return y, x, h, w
+
+    def confirm(self, title, text, danger=False, default=False):
+        lines = []
+        for para in text.split("\n"):
+            lines += wrap(para, 52)
+
+        def draw():
+            y, x, h, w = self.dialog_box(len(lines) + 5, 58, title, danger)
+            for i, l in enumerate(lines):
+                put(self.scr, y + 2 + i, x + 3, l, 0, w - 6)
+            yes = "[Y/n]" if default else "[y/N]"
+            put(self.scr, y + h - 2, x + w - len(yes) - 3, yes, C["dim"])
+
+        def key(k):
+            if k in ("y", "Y"):
+                return "yes"
+            if k in ("n", "N", ESC, "q"):
+                return "no"
+            if k in ENTER:
+                return "yes" if default else "no"
+
+        return self.modal(draw, key) == "yes"
+
+    def prompt(self, title, label, default="", paths=False, note=""):
+        f = Field("v", label, "path" if paths else "text", default)
+        res = self.form(title, [f], notes=[note] if note else [], ok="OK", submit_on_enter=True)
+        return res["v"].strip() if res else None
+
+    def menu(self, title, items, width=46):
+        """items: (value, label, shortcut, enabled) or None for a separator."""
+        sel = [i for i, it in enumerate(items) if it and it[3]]
+        if not sel:
+            return None
+        cur = [sel[0]]
+
+        def draw():
+            y, x, h, w = self.dialog_box(len(items) + 2, width, title)
+            H = h - 2
+            first = max(0, cur[0] - H + 1)
+            for n, it in enumerate(items[first:first + H]):
+                i = first + n
+                yy = y + 1 + n
+                if it is None:
+                    put(self.scr, yy, x + 2, "─" * (w - 4), C["dim"])
+                    continue
+                value, label, short, enabled = it
+                attr = curses.A_REVERSE if i == cur[0] else 0
+                put(self.scr, yy, x + 1, " " * (w - 2), attr)
+                put(self.scr, yy, x + 3, label, attr | (0 if enabled else C["dim"]), w - 10)
+                if short:
+                    put(self.scr, yy, x + w - 3 - len(short), short, attr | (C["acc"] if enabled else C["dim"]))
+
+        def key(k):
+            if k in (ESC, "q"):
+                return "__cancel__"
+            if k in (curses.KEY_UP, "k", curses.KEY_BTAB):
+                prev = [i for i in sel if i < cur[0]]
+                cur[0] = prev[-1] if prev else sel[-1]
+            elif k in (curses.KEY_DOWN, "j", "\t"):
+                nxt = [i for i in sel if i > cur[0]]
+                cur[0] = nxt[0] if nxt else sel[0]
+            elif k in ENTER or k == " ":
+                return items[cur[0]][0]
+            else:
+                for it in items:
+                    if it and it[3] and it[2] and k == it[2]:
+                        return it[0]
+
+        r = self.modal(draw, key)
+        return None if r == "__cancel__" else r
+
+    def form(self, title, fields, notes=(), ok="Save", validate=None, submit_on_enter=False,
+             width=70, extra_buttons=(), focus=0):
+        buttons = [Field("__ok__", ok, "button")] + [Field(k, l, "button") for k, l in extra_buttons] \
+            + [Field("__cancel__", "Cancel", "button")]
+        state = {"focus": focus, "error": ""}
+        notes = [n for n in notes if n]
+
+        def values():
+            return {f.key: f.val for f in fields}
+
+        def visible():
+            v = values()
+            return [f for f in fields if not f.show_if or f.show_if(v)]
+
+        def items():
+            return visible() + buttons
+
+        def draw():
+            vis = visible()
+            its = items()
+            state["focus"] = min(state["focus"], len(its) - 1)
+            focused = its[state["focus"]]
+            lw = max([len(f.label) for f in vis] + [4]) + 2
+            note_lines = []
+            for n in notes:
+                note_lines += wrap(n, width - 6)
+            h = len(note_lines) + (1 if note_lines else 0) + len(vis) + 5 + (1 if state["error"] else 0)
+            y, x, h, w = self.dialog_box(h, width, title)
+            yy = y + 2
+            for n in note_lines:
+                put(self.scr, yy, x + 3, n, C["dim"], w - 6)
+                yy += 1
+            if note_lines:
+                yy += 1
+            vw = w - 6 - lw
+            for f in vis:
+                is_f = f is focused
+                put(self.scr, yy, x + 3, f.label, C["acc"] if is_f else C["dim"])
+                vx = x + 3 + lw
+                if f.edit:
+                    f.edit.render(self.scr, yy, vx, vw, curses.A_UNDERLINE, is_f)
+                elif f.kind == "bool":
+                    mark = "[x]" if f.value else "[ ]"
+                    put(self.scr, yy, vx, mark, curses.A_REVERSE if is_f else 0)
+                    if f.hint:
+                        put(self.scr, yy, vx + 4, f.hint, C["dim"], vw - 4)
+                elif f.kind == "choice":
+                    put(self.scr, yy, vx, f"‹ {f.display_choice()} ›", curses.A_REVERSE if is_f else 0, vw)
+                yy += 1
+            if state["error"]:
+                put(self.scr, yy, x + 3, state["error"], C["err"], w - 6)
+                yy += 1
+            yy += 1
+            bx = x + w - 3 - sum(len(b.label) + 5 for b in buttons)
+            for b in buttons:
+                attr = curses.A_REVERSE | C["acc"] if b is focused else C["dim"]
+                bx += put(self.scr, yy, bx, f"[ {b.label} ]", attr) + 1
+
+        def key(k):
+            its = items()
+            f = its[state["focus"]]
+            state["error"] = ""
+            if k == ESC:
+                return "__cancel__"
+            if k == "\t" and f.edit and f.edit.paths:
+                f.edit.complete()
+                return None
+            if k in (curses.KEY_DOWN, "\t") or (k in ENTER and f.edit and not submit_on_enter):
+                state["focus"] = (state["focus"] + 1) % len(its)
+                return None
+            if k in (curses.KEY_UP, curses.KEY_BTAB):
+                state["focus"] = (state["focus"] - 1) % len(its)
+                return None
+            if f.kind == "button":
+                if k in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                    step = -1 if k == curses.KEY_LEFT else 1
+                    bi = buttons.index(f)
+                    if 0 <= bi + step < len(buttons):
+                        state["focus"] = len(its) - len(buttons) + bi + step
+                    return None
+                if k in ENTER or k == " ":
+                    return submit(f.key)
+                return None
+            if f.edit:
+                if k in ENTER:
+                    return submit("__ok__")
+                f.edit.key(k)
+            elif f.kind == "bool" and k in ENTER and submit_on_enter:
+                return submit("__ok__")
+            elif f.kind == "bool" and (k == " " or k in ENTER):
+                f.value = not f.value
+            elif f.kind == "choice" and k in (" ", curses.KEY_RIGHT, curses.KEY_LEFT) + ENTER:
+                f.cycle(-1 if k == curses.KEY_LEFT else 1)
+            return None
+
+        def submit(which):
+            if which == "__cancel__":
+                return which
+            v = values()
+            if which == "__ok__" and validate:
+                err = validate(v)
+                if err:
+                    state["error"] = err
+                    return None
+            v["__button__"] = which
+            return v
+
+        r = self.modal(draw, key)
+        return None if r == "__cancel__" else r
+
+    def shell_out(self, cmd, banner=""):
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            if banner:
+                print(banner, flush=True)
+            subprocess.call(cmd)
+        except OSError as e:
+            print(e)
+            input("Press Enter to go back")
+        finally:
+            curses.reset_prog_mode()
+            self.scr.refresh()
+            curses.curs_set(0)
+
+    # actions -----------------------------------------------------------------
+    def spawn(self, c, busy, fn):
+        c.busy, c.last_op = busy, time.time()
+
+        def work():
+            try:
+                fn()
+            finally:
+                c.busy, c.last_op = "", time.time()
+                self.m.refresh(c.uuid)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def notify(self, title, body=""):
+        if self.cfg.get("notify"):
+            notify(title, body)
+
+    def connect(self, c, secret=None, reconnect=False):
+        if c.busy:
+            return self.flash(f"{c.name}: {c.busy.lower()}", "warn")
+        if not reconnect and c.state in ("activated", "activating"):
+            return self.flash(f"{c.name} is already {'connected' if c.active else 'connecting'}")
+        if secret is None and not reconnect and c.password_state in ("ask", "missing"):
+            return self.credentials(c)
+        uuid, name = c.uuid, c.name
+
+        def work():
+            t0 = time.time()
+            if reconnect and c.state:
+                nmcli("connection", "down", "uuid", uuid, timeout=60)
+                c.busy = "Connecting…"
+            if secret is not None:
+                rc, out, err = nmcli("connection", "up", "uuid", uuid, "passwd-file", "/dev/stdin",
+                                     input=f"vpn.secrets.password:{secret}\n")
+            else:
+                rc, out, err = nmcli("connection", "up", "uuid", uuid)
+            if rc == 0:
+                self.m.events.put(("ok", f"{name} connected"))
+                self.notify("VPN connected", name)
+                return
+            msg = nm_error(out, err)
+            time.sleep(0.5)  # let the journal catch up before looking for AUTH_FAILED
+            if self.m.logs.since(uuid, t0, "AUTH_FAILED"):
+                self.m.events.put(("auth", (uuid, "The server rejected the username or password.")))
+            elif re.search(r"secret", msg, re.I):
+                self.m.events.put(("auth", (uuid, None)))
+            elif re.search(r"by user|deactivated", msg, re.I):
+                self.m.events.put(("info", f"{name}: connection cancelled"))
+            else:
+                self.m.events.put(("err", f"{name}: {msg}  (l for the log)"))
+                self.notify("VPN failed", f"{name}: {msg}")
+
+        self.spawn(c, "Reconnecting…" if reconnect else "Connecting…", work)
+
+    def disconnect(self, c):
+        if not c.state:
+            return self.flash(f"{c.name} is not connected")
+        uuid, name = c.uuid, c.name
+
+        def work():
+            rc, out, err = nmcli("connection", "down", "uuid", uuid, timeout=60)
+            if rc == 0:
+                self.m.events.put(("info", f"{name} disconnected"))
+                self.notify("VPN disconnected", name)
+            else:
+                self.m.events.put(("err", f"{name}: {nm_error(out, err)}"))
+
+        self.spawn(c, "Disconnecting…", work)
+
+    def toggle(self, c):
+        if c.busy == "Connecting…" or c.state == "activating":
+            self.disconnect(c)  # cancel
+        elif c.state:
+            self.disconnect(c)
+        else:
+            self.connect(c)
+
+    def reconnect(self, c):
+        if not c.state:
+            return self.connect(c)
+        self.connect(c, reconnect=True)
+
+    def credentials(self, c, reason=None):
+        if not c.uses_password:
+            return self.flash(f"{c.name} authenticates with its certificate only; no password to set")
+        flags = c.data.get("password-flags", "0")
+        fields = [Field("user", "Username", "text", c.info.get("vpn.user-name", "")),
+                  Field("pw", "Password", "password", ""),
+                  Field("save", "Remember", "bool", flags != "2", hint="save the password for next time")]
+        notes = [reason or "", f"Enter the credentials for {c.name}."]
+        verb = "Reconnect" if c.state else "Connect"
+
+        def validate(v):
+            if not v["user"].strip():
+                return "Username is required."
+            if not v["pw"]:
+                return "Password is required."
+            if "\n" in v["pw"]:
+                return "Password cannot contain a newline."
+
+        f = self.form(f"Sign in · {c.name}", fields, notes=notes, ok=verb, validate=validate,
+                      submit_on_enter=True, width=64, focus=1 if fields[0].val else 0)
+        if not f:
+            return
+        # Drop any stored password first: NM only asks for (and then saves) the
+        # new one when none is stored. Flag 2 strips it, flag 0 saves the next.
+        args = ["vpn.user-name", f["user"].strip(), "+vpn.data", "password-flags=2"]
+        rc, out, err = nmcli("connection", "modify", "uuid", c.uuid, *args)
+        if rc == 0 and f["save"]:
+            rc, out, err = nmcli("connection", "modify", "uuid", c.uuid, "+vpn.data", "password-flags=0")
+        if rc:
+            return self.flash(f"Could not update {c.name}: {nm_error(out, err)}", "err")
+        c.data["password-flags"] = "0" if f["save"] else "2"
+        self.m.refresh(c.uuid)
+        self.connect(c, secret=f["pw"], reconnect=bool(c.state))
+
+    def clear_password(self, c):
+        if not c.uses_password:
+            return self.flash(f"{c.name} has no password to clear")
+        if c.password_state not in ("saved", "agent"):
+            return self.flash(f"No password is saved for {c.name}")
+        if not self.confirm("Clear saved password",
+                            f"Forget the saved password for {c.name}?\nYou will be asked for it on the next connect."):
+            return
+        rc, out, err = nmcli("connection", "modify", "uuid", c.uuid, "+vpn.data", "password-flags=2")
+        if rc == 0:
+            rc, out, err = nmcli("connection", "modify", "uuid", c.uuid, "+vpn.data", "password-flags=0")
+        if rc:
+            return self.flash(nm_error(out, err), "err")
+        self.m.refresh(c.uuid)
+        self.flash(f"Saved password for {c.name} cleared", "ok")
+
+    def edit(self, c):
+        d = c.data
+        rs = " ".join(":".join(r) for r in remotes(d))
+        proxy = d.get("proxy-type", "none")
+        fields = [
+            Field("name", "Name", "text", c.name),
+            Field("remote", "Server", "text", rs),
+            Field("user", "Username", "text", c.info.get("vpn.user-name", ""))
+            if c.uses_password else None,
+            Field("full", "Full tunnel", "bool", c.info.get("ipv4.never-default") != "yes",
+                  hint="send all traffic through the VPN"),
+            Field("persist", "Auto-reconnect", "bool", c.info.get("vpn.persistent") == "yes",
+                  hint="stay up across network changes"),
+            Field("login", "At login", "bool", autostart_enabled(c.uuid),
+                  hint="connect when you log in"),
+            Field("proxy", "Proxy", "choice", proxy if proxy in ("http", "socks") else "none",
+                  choices=[("none", "none"), ("http", "HTTP"), ("socks", "SOCKS")]),
+            Field("proxy_server", "Proxy host", "text", d.get("proxy-server", ""),
+                  show_if=lambda v: v["proxy"] != "none"),
+            Field("proxy_port", "Proxy port", "text", d.get("proxy-port", ""),
+                  show_if=lambda v: v["proxy"] != "none"),
+        ]
+        fields = [f for f in fields if f]
+
+        def validate(v):
+            if not v["name"].strip():
+                return "Name is required."
+            if not v["remote"].strip():
+                return "Server is required (host, host:port or host:port:proto)."
+            for tok in re.split(r"[\s,]+", v["remote"].strip()):
+                parts = tok.split(":")
+                if len(parts) > 1 and not parts[1].isdigit():
+                    return f"Bad port in '{tok}'."
+                if len(parts) > 2 and parts[2] not in ("udp", "tcp", "udp4", "udp6", "tcp4", "tcp6",
+                                                        "tcp-client", "tcp4-client", "tcp6-client"):
+                    return f"Bad protocol in '{tok}' (udp, tcp, udp4, tcp4…)."
+            if v["proxy"] != "none":
+                if not v["proxy_server"].strip():
+                    return "Proxy host is required."
+                if not v["proxy_port"].strip().isdigit():
+                    return "Proxy port must be a number."
+            other = [x.name for x in self.conns() if x.uuid != c.uuid]
+            if v["name"].strip() in other:
+                return "Another profile already has that name."
+
+        v = self.form(f"Edit · {c.name}", fields, validate=validate,
+                      extra_buttons=[("__advanced__", "Advanced…")])
+        if not v:
+            return
+        if v["__button__"] == "__advanced__":
+            return self.advanced(c)
+
+        args, name = [], v["name"].strip()
+        if name != c.name:
+            args += ["connection.id", name]
+        remote = " ".join(re.split(r"[\s,]+", v["remote"].strip()))
+        if remote != rs:
+            args += ["+vpn.data", f"remote={remote}"]
+        if c.uses_password and v["user"].strip() != c.info.get("vpn.user-name", ""):
+            args += ["vpn.user-name", v["user"].strip()]
+        never = "no" if v["full"] else "yes"
+        if never != (c.info.get("ipv4.never-default") or "no"):
+            args += ["ipv4.never-default", never, "ipv6.never-default", never]
+        persist = "yes" if v["persist"] else "no"
+        if persist != (c.info.get("vpn.persistent") or "no"):
+            args += ["vpn.persistent", persist]
+        if v["proxy"] == "none":
+            if proxy in ("http", "socks"):
+                args += ["-vpn.data", "proxy-type", "-vpn.data", "proxy-server", "-vpn.data", "proxy-port"]
+        elif (v["proxy"], v["proxy_server"].strip(), v["proxy_port"].strip()) != \
+                (proxy, d.get("proxy-server", ""), d.get("proxy-port", "")):
+            args += ["+vpn.data", f"proxy-type={v['proxy']}",
+                     "+vpn.data", f"proxy-server={v['proxy_server'].strip()}",
+                     "+vpn.data", f"proxy-port={v['proxy_port'].strip()}"]
+
+        if v["login"] != autostart_enabled(c.uuid) or (v["login"] and name != c.name):
+            set_autostart(c.uuid, name, v["login"])
+        if not args:
+            return self.flash("Saved", "ok")
+        rc, out, err = nmcli("connection", "modify", "uuid", c.uuid, *args)
+        if rc:
+            return self.flash(f"Could not save: {nm_error(out, err)}", "err")
+        if name != c.name and bar_connection() == c.name:
+            set_bar_connection(name)
+        c.name = name
+        self.m.refresh(c.uuid)
+        changed_live = any(a in args for a in ("+vpn.data", "-vpn.data", "ipv4.never-default", "vpn.persistent"))
+        if c.state and changed_live and self.confirm("Apply changes", "Reconnect now to apply the changes?",
+                                                     default=True):
+            self.reconnect(c)
+        else:
+            self.flash(f"Saved {name}" + (" (applies on next connect)" if c.state and changed_live else ""), "ok")
+
+    def advanced(self, c):
+        self.shell_out(["nmcli", "connection", "edit", "uuid", c.uuid],
+                       f"\nEditing '{c.name}' with nmcli's editor.\n"
+                       "  print         show every setting\n"
+                       "  describe vpn  explain the VPN settings\n"
+                       "  set <setting>.<property> <value>   then: save, quit\n")
+        self.m.refresh(c.uuid)
+
+    def export(self, c):
+        base = os.path.join(HOME, "Downloads") if os.path.isdir(os.path.join(HOME, "Downloads")) else HOME
+        default = os.path.join(base, re.sub(r"[^\w.-]+", "-", c.name) + ".ovpn").replace(HOME, "~", 1)
+        path = self.prompt(f"Export · {c.name}", "Save to", default, paths=True,
+                           note="Writes an .ovpn that references the certificate files on this machine.")
+        if not path:
+            return
+        path = os.path.expanduser(path)
+        if os.path.exists(path) and not self.confirm("Export", f"{path} exists. Overwrite it?"):
+            return
+        rc, out, err = nmcli("connection", "export", "uuid", c.uuid, path)
+        self.flash(f"Exported to {path}" if rc == 0 else f"Export failed: {nm_error(out, err)}",
+                   "ok" if rc == 0 else "err")
+
+    def delete(self, c):
+        if not self.confirm("Delete profile", f"Delete {c.name}?\n"
+                            "This removes the profile and its saved password. The certificate files stay.",
+                            danger=True):
+            return
+        if c.state:
+            nmcli("connection", "down", "uuid", c.uuid, timeout=60)
+        rc, out, err = nmcli("connection", "delete", "uuid", c.uuid)
+        if rc:
+            return self.flash(nm_error(out, err), "err")
+        set_autostart(c.uuid, c.name, False)
+        self.sel_uuid = None
+        self.m.refresh()
+        self.flash(f"Deleted {c.name}", "ok")
+
+    def set_bar(self, c):
+        set_bar_connection(c.name)
+        self.flash(f"The bar widget now toggles {c.name}", "ok")
+
+    def find_ovpn(self):
+        found = []
+        for root in [os.path.join(HOME, d) for d in ("Downloads", "Documents", "Desktop")] + [HOME]:
+            if not os.path.isdir(root):
+                continue
+            depth0 = root.count(os.sep)
+            for dirpath, dirnames, files in os.walk(root):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                if dirpath.count(os.sep) - depth0 >= (0 if root == HOME else 3):
+                    dirnames[:] = []
+                for fn in files:
+                    if fn.lower().endswith(".ovpn"):
+                        found.append(os.path.join(dirpath, fn))
+        found = sorted(set(found), key=lambda p: -os.path.getmtime(p))
+        return found[:30]
+
+    def import_file(self):
+        cands = self.find_ovpn()
+        choice = "__path__"
+        if cands:
+            items = [(p, p.replace(HOME, "~", 1), "", True) for p in cands]
+            items += [None, ("__path__", "Type a path…", "/", True)]
+            choice = self.menu("Import .ovpn file", items, width=min(max(len(i[1]) for i in items if i) + 10, 90))
+            if not choice:
+                return
+        if choice == "__path__":
+            choice = self.prompt("Import .ovpn file", "File", "~/", paths=True, note="Tab completes paths.")
+            if not choice:
+                return
+        self.import_path(os.path.expanduser(choice))
+
+    def import_url(self):
+        url = self.prompt("Import from URL", "URL", "https://",
+                          note="Downloads an .ovpn profile (with inline certificates) and imports it.")
+        if not url or url == "https://":
+            return
+        self.flash("Downloading…")
+        self.draw()
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "vpn-tui"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = r.read(2_000_000)
+        except Exception as e:
+            return self.flash(f"Download failed: {e}", "err")
+        text = body.decode("utf-8", "replace")
+        if not re.search(r"^\s*(client|remote)\b", text, re.M):
+            return self.flash("That does not look like an OpenVPN profile", "err")
+        name = os.path.basename(urllib.parse.urlparse(url).path) or "imported"
+        name = re.sub(r"[^\w.-]+", "-", name)
+        if not name.endswith(".ovpn"):
+            name += ".ovpn"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, name)
+            with open(path, "w") as f:
+                f.write(text)
+            self.import_path(path)
+
+    def import_path(self, path):
+        if not os.path.isfile(path):
+            return self.flash(f"No such file: {path}", "err")
+        rc, out, err = nmcli("connection", "import", "type", "openvpn", "file", path)
+        m = re.search(r"\(([0-9a-f-]{36})\)", out)
+        if rc or not m:
+            return self.flash(f"Import failed: {nm_error(out, err)}", "err")
+        uuid = m.group(1)
+        self.m.poll()
+        self.sel_uuid = uuid
+        c = self.m.get(uuid)
+        if not c:
+            return self.flash("Imported", "ok")
+        name = self.prompt("Name the new profile", "Name", c.name)
+        if name and name != c.name:
+            if nmcli("connection", "modify", "uuid", uuid, "connection.id", name)[0] == 0:
+                c.name = name
+                self.m.refresh(uuid)
+        msg, level = f"Imported {c.name}. Press ⏎ to connect.", "ok"
+        rs = remotes(c.data)
+        if rs and is_private_host(rs[0][0]):
+            msg, level = (f"Imported {c.name}, but its server {rs[0][0]} is a LAN address; "
+                          "press e to set the public host name."), "warn"
+        self.flash(msg, level, 12)
+
+    def settings(self):
+        conns = self.conns()
+        bar = bar_connection()
+        fields = [Field("notify", "Notifications", "bool", bool(self.cfg.get("notify")),
+                        hint="notify when connect/disconnect finishes"),
+                  Field("bar", "Bar widget", "choice", bar,
+                        choices=[(c.name, c.name) for c in conns]
+                        + ([] if bar in [c.name for c in conns] else [(bar, bar or "(none)")]))]
+        v = self.form("Settings", fields, width=66,
+                      notes=["Per-profile options (tunnel, auto-reconnect, connect at login, proxy) "
+                             "are under Edit (e)."])
+        if not v:
+            return
+        self.cfg["notify"] = v["notify"]
+        save_config(self.cfg)
+        if v["bar"] and v["bar"] != bar:
+            set_bar_connection(v["bar"])
+        self.flash("Settings saved", "ok")
+
+    def actions_menu(self, c):
+        on = bool(c and c.state)
+        has = c is not None
+        items = [
+            ("connect", "Connect", "c", has and not on),
+            ("disconnect", "Disconnect", "d", on),
+            ("reconnect", "Reconnect", "r", on),
+            ("log", "View log", "l", has),
+            ("edit", "Edit settings…", "e", has),
+            ("advanced", "Advanced editor (nmcli)…", "E", has),
+            ("password", "Change username/password…", "p", has and c.uses_password),
+            ("clear", "Clear saved password", "x", has and c.password_state in ("saved", "agent")),
+            ("export", "Export .ovpn…", "o", has),
+            ("bar", "Use for the bar widget", "b", has and c.name != bar_connection()),
+            ("delete", "Delete profile…", "D", has),
+            None,
+            ("import", "Import file…", "i", True),
+            ("import_url", "Import from URL…", "u", True),
+            ("settings", "Settings…", "s", True),
+            ("help", "Help", "?", True),
+            ("quit", "Quit", "q", True),
+        ]
+        return self.menu(c.name if c else "OpenVPN", items)
+
+    def help(self):
+        keys = [("↑↓ j k", "select a profile"), ("⏎", "connect / disconnect (cancels while connecting)"),
+                ("c d r", "connect, disconnect, reconnect"), ("l", "full log for the profile"),
+                ("e", "edit name, server, tunnel, reconnect, login, proxy"),
+                ("E", "advanced editor (every NetworkManager setting)"),
+                ("p", "change username/password, then (re)connect"), ("x", "clear the saved password"),
+                ("i u", "import an .ovpn file / from a URL"), ("o", "export as .ovpn"),
+                ("b", "make the bar widget toggle this profile"), ("D", "delete the profile"),
+                ("s", "settings"), ("m space", "menu with every action"), ("q", "quit")]
+
+        def draw():
+            y, x, h, w = self.dialog_box(len(keys) + 4, 72, "Keys")
+            for i, (k, d) in enumerate(keys):
+                put(self.scr, y + 2 + i, x + 3, f"{k:<9}", C["acc"] | curses.A_BOLD)
+                put(self.scr, y + 2 + i, x + 13, d, 0, w - 16)
+
+        self.modal(draw, lambda k: True)
+
+    # log view ----------------------------------------------------------------
+    def log_view(self, c):
+        st = {"all": c is None, "off": 0, "filter": "", "cache": None}
+
+        def lines(width):
+            key = (self.m.logs.version, width, st["all"], st["filter"])
+            if st["cache"] and st["cache"][0] == key:
+                return st["cache"][1]
+            out, day = [], None
+            flt = st["filter"].lower()
+            for ts, _, level, msg in self.m.logs.entries(None if st["all"] else c.uuid):
+                if flt and flt not in msg.lower():
+                    continue
+                t = time.localtime(ts)
+                if (t.tm_year, t.tm_yday) != day:
+                    day = (t.tm_year, t.tm_yday)
+                    out.append((f"── {time.strftime('%a %d %b %Y', t)} ──", C["acc"]))
+                stamp = time.strftime("%H:%M:%S  ", t)
+                for i, part in enumerate(wrap(msg, width - len(stamp))):
+                    out.append(((stamp if i == 0 else " " * len(stamp)) + part, C.get(level, 0)))
+            st["cache"] = (key, out)
+            return out
+
+        def body(top, left, height, width):
+            title = "Log · " + ("all OpenVPN profiles" if st["all"] else c.name)
+            if st["filter"]:
+                title += f" · filter “{st['filter']}”"
+            box(self.scr, top, left, height, width, title)
+            ls = lines(width - 4)
+            rows = height - 2
+            st["off"] = max(0, min(st["off"], len(ls) - rows))
+            end = len(ls) - st["off"]
+            for i, (text, attr) in enumerate(ls[max(0, end - rows):end]):
+                put(self.scr, top + 1 + i, left + 2, text, attr, width - 4)
+            if not ls:
+                put(self.scr, top + 1, left + 2, self.m.logs.error or "Nothing logged yet.", C["dim"])
+            tag = " following " if st["off"] == 0 else f" ↑ {st['off']} lines "
+            put(self.scr, top + height - 1, left + width - len(tag) - 2, tag, C["dim"])
+
+        def key(k):
+            H = self.scr.getmaxyx()[0]
+            page = max(1, H - 6)
+            if k in ("q", ESC, "l"):
+                return True
+            if k in (curses.KEY_UP, "k"):
+                st["off"] += 1
+            elif k in (curses.KEY_DOWN, "j"):
+                st["off"] = max(0, st["off"] - 1)
+            elif k in (curses.KEY_PPAGE, "b"):
+                st["off"] += page
+            elif k in (curses.KEY_NPAGE, " ", "f"):
+                st["off"] = max(0, st["off"] - page)
+            elif k in (curses.KEY_HOME, "g"):
+                st["off"] = 10 ** 9
+            elif k in (curses.KEY_END, "G"):
+                st["off"] = 0
+            elif k == "a" and c is not None:
+                st["all"] = not st["all"]
+            elif k == "/":
+                v = self.prompt("Filter log", "Contains", st["filter"], note="Empty clears the filter.")
+                if v is not None:
+                    st["filter"], st["off"] = v, 0
+            elif k in ("w", "y"):
+                text = "\n".join(t for t, _ in lines(10 ** 6))
+                if k == "y":
+                    ok = copy_to_clipboard(text)
+                    self.flash("Log copied to the clipboard" if ok else "No clipboard tool (wl-copy, xclip or xsel)",
+                               "ok" if ok else "err")
+                else:
+                    name = re.sub(r"[^\w.-]+", "-", c.name if c and not st["all"] else "openvpn")
+                    path = os.path.join(HOME, f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.log")
+                    with open(path, "w") as f:
+                        f.write(text + "\n")
+                    self.flash(f"Saved {path.replace(HOME, '~', 1)}", "ok")
+
+        hints = [("↑↓", "scroll"), ("PgUp/PgDn", "page"), ("g/G", "top/follow"), ("a", "this/all"),
+                 ("/", "filter"), ("w", "save"), ("y", "copy"), ("q", "back")]
+        self.modal(lambda: None, key, body=body, hints=hints)
+
+    # main loop ---------------------------------------------------------------
+    def run(self):
+        self.scr.timeout(250)
+        if self.start_auth:
+            deadline = time.time() + 5
+            while time.time() < deadline and not self.find(self.start_auth):
+                time.sleep(0.1)
+            c = self.find(self.start_auth)
+            if c:
+                self.sel_uuid = c.uuid
+                self.credentials(c)
+        while True:
+            self.handle_events()
+            self.draw()
+            k = self.getkey()
+            if k is None or k == curses.KEY_RESIZE:
+                continue
+            if self.key(k) is False:
+                return
+
+    def key(self, k):
+        c = self.current()
+        if k in (curses.KEY_UP, "k"):
+            return self.move(-1)
+        if k in (curses.KEY_DOWN, "j"):
+            return self.move(1)
+        if k in (curses.KEY_HOME, "g"):
+            return self.move(-10 ** 6)
+        if k in (curses.KEY_END, "G"):
+            return self.move(10 ** 6)
+        action = {" ": "menu", "m": "menu", "q": "quit", ESC: "quit", "c": "connect", "d": "disconnect",
+                  "r": "reconnect", "l": "log", "e": "edit", "E": "advanced", "p": "password",
+                  "x": "clear", "o": "export", "b": "bar", "D": "delete", curses.KEY_DC: "delete",
+                  "i": "import", "u": "import_url", "s": "settings", "?": "help"}.get(k)
+        if k in ENTER:
+            action = "toggle"
+        if action == "menu":
+            action = self.actions_menu(c)
+        if action == "quit":
+            return False
+        if action in ("import", "import_url", "settings", "help"):
+            return {"import": self.import_file, "import_url": self.import_url,
+                    "settings": self.settings, "help": self.help}[action]()
+        if action == "log":
+            return self.log_view(c)
+        if not action or not c:
+            return None
+        return {"toggle": self.toggle, "connect": self.connect, "disconnect": self.disconnect,
+                "reconnect": self.reconnect, "edit": self.edit, "advanced": self.advanced,
+                "password": self.credentials, "clear": self.clear_password, "export": self.export,
+                "bar": self.set_bar, "delete": self.delete}[action](c)
+
+
+# ── entry points ─────────────────────────────────────────────────────────────
+
+def resolve(target):
+    for r in list_vpns():
+        if target in (r["uuid"], r["name"]):
+            return r
+    return None
+
+
+def cli_connect(target):
+    r = resolve(target)
+    if not r:
+        print(f"No VPN profile named '{target}'", file=sys.stderr)
+        return 1
+    if r["state"] in ("activated", "activating"):
+        return 0
+    run(["nm-online", "-q", "-t", "60"], timeout=70)  # at login, wait for Wi-Fi/Ethernet
+    rc, out, err = nmcli("connection", "up", "uuid", r["uuid"])
+    cfg = load_config()
+    if rc == 0:
+        if cfg.get("notify"):
+            notify("VPN connected", r["name"])
+        return 0
+    msg = nm_error(out, err)
+    launcher = next(([*cmd, SELF] for cmd in (["omarchy-launch-or-focus-tui"], ["xdg-terminal-exec"])
+                     if shutil.which(cmd[0])), None)
+    if re.search(r"secret", msg, re.I) and launcher:
+        notify("VPN needs credentials", r["name"])
+        subprocess.Popen([*launcher, "--auth", r["uuid"]], start_new_session=True)
+    else:
+        notify("VPN failed", f"{r['name']}: {msg}")
+    print(msg, file=sys.stderr)
+    return 1
+
+
+def cli_disconnect(target):
+    r = resolve(target)
+    if not r:
+        print(f"No VPN profile named '{target}'", file=sys.stderr)
+        return 1
+    if not r["state"]:
+        return 0
+    rc, out, err = nmcli("connection", "down", "uuid", r["uuid"], timeout=60)
+    if rc:
+        print(nm_error(out, err), file=sys.stderr)
+    return rc
+
+
+def tui(scr, args):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    init_colors()
+    scr.keypad(True)
+    model = Model()
+    model.poll()
+    threading.Thread(target=model.run, daemon=True).start()
+    try:
+        App(scr, model, args).run()
+    finally:
+        model.stopped.set()
+        model.logs.stop()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Manage NetworkManager OpenVPN profiles.")
+    ap.add_argument("--connect", metavar="NAME", help="connect a profile and exit")
+    ap.add_argument("--disconnect", metavar="NAME", help="disconnect a profile and exit")
+    ap.add_argument("--auth", metavar="NAME", help="open the TUI at the credentials prompt")
+    ap.add_argument("--version", action="version", version=f"vpn-tui {__version__}")
+    args = ap.parse_args()
+    if not shutil.which("nmcli"):
+        sys.exit("vpn-tui needs NetworkManager's nmcli")
+    if args.connect:
+        sys.exit(cli_connect(args.connect))
+    if args.disconnect:
+        sys.exit(cli_disconnect(args.disconnect))
+    if not sys.stdin.isatty():
+        sys.exit("vpn-tui needs a terminal")
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(tui, args)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

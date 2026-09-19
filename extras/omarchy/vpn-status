@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Bar widget state for an Omarchy "command" module (see extras/omarchy/README.md).
+# Prints Waybar-style JSON: text = icon, class "active" highlights the button.
+
+# The profile set with "b" in vpn-tui, else $OMARCHY_VPN_NAME, else the first VPN profile.
+VPN_NAME="${OMARCHY_VPN_NAME:-$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/vpn-tui/bar-connection" 2>/dev/null)}"
+VPN_NAME="${VPN_NAME:-$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2 == "vpn" { print $1; exit }')}"
+
+state=$(nmcli -t -f NAME,STATE connection show --active 2>/dev/null |
+  awk -F: -v n="$VPN_NAME" '$1 == n { print $2; exit }')
+
+case "$state" in
+activated)
+  ip=$(nmcli -g IP4.ADDRESS connection show "$VPN_NAME" 2>/dev/null | head -1 | cut -d/ -f1)
+  printf '{"text":"󰦝","class":"active","tooltip":"%s: connected%s"}\n' "$VPN_NAME" "${ip:+ ($ip)}"
+  ;;
+activating)
+  printf '{"text":"󰖂","tooltip":"%s: connecting…"}\n' "$VPN_NAME"
+  ;;
+*)
+  printf '{"text":"󰦜","tooltip":"%s: off — click to connect"}\n' "${VPN_NAME:-VPN}"
+  ;;
+esac

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Left-click action: connect or disconnect the bar's VPN profile. When
+# NetworkManager has no saved password, open vpn-tui at its sign-in prompt.
+set -uo pipefail
+
+VPN_NAME="${OMARCHY_VPN_NAME:-$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/vpn-tui/bar-connection" 2>/dev/null)}"
+VPN_NAME="${VPN_NAME:-$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2 == "vpn" { print $1; exit }')}"
+
+notify() { notify-send -a VPN -i network-vpn-symbolic "$1" "${2-}"; }
+
+if [[ -z $VPN_NAME ]]; then
+  notify "No VPN profile" "Import one with vpn-tui"
+  omarchy-launch-or-focus-tui vpn-tui
+  exit
+fi
+
+state=$(nmcli -t -f NAME,STATE connection show --active 2>/dev/null |
+  awk -F: -v n="$VPN_NAME" '$1 == n { print $2; exit }')
+
+if [[ -n $state ]]; then
+  if nmcli connection down id "$VPN_NAME" >/dev/null 2>&1; then
+    notify "VPN disconnected" "$VPN_NAME"
+  else
+    notify "VPN failed to disconnect" "$VPN_NAME"
+  fi
+  exit
+fi
+
+notify "VPN connecting…" "$VPN_NAME"
+if err=$(nmcli connection up id "$VPN_NAME" 2>&1); then
+  notify "VPN connected" "$VPN_NAME"
+else
+  case "$err" in
+  *[Ss]ecrets*)
+    notify "VPN needs credentials" "Opening a prompt…"
+    omarchy-launch-or-focus-tui vpn-tui --auth "$VPN_NAME"
+    ;;
+  *) notify "VPN failed" "${err##*: }" ;;
+  esac
+fi
