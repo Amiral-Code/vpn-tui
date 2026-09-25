@@ -15,7 +15,8 @@ uses only the standard library.
 |---|---|
 | Connect / Disconnect / Reconnect | `Enter` toggles (and cancels while connecting), or `c` `d` `r` |
 | Show Status | Always on screen, updated every second: uptime, server, VPN address, traffic and speed, full or split tunnel, pushed networks, DNS |
-| View Log | `l`: OpenVPN and NetworkManager log for the profile, with dates. `/` filters, `w` saves, `y` copies |
+| View Log | `l`: OpenVPN, NetworkManager and D-Bus log for the profile, with dates. `/` filters, `w` saves, `y` copies |
+| *(no equivalent)* | `h`: health check — probes the live tunnel instead of reading status fields |
 | Username / password prompt | Opens by itself when a password is needed, with a **Remember** checkbox |
 | Change Password / Clear Saved Passwords | `p` / `x` |
 | Edit Config | `e`: name, server(s), full or split tunnel, auto-reconnect, connect at login, HTTP/SOCKS proxy. `E` opens `nmcli`'s editor for every other setting |
@@ -24,6 +25,24 @@ uses only the standard library.
 | Tray balloon messages | Status line in the TUI, plus optional desktop notifications |
 
 It also exports profiles as `.ovpn` (`o`) and deletes them (`D`).
+
+## Health check
+
+`h` probes a connected profile and reports what actually answers, rather than
+what NetworkManager claims:
+
+```
+✓ Interface        tun0 holds 10.1.1.6
+✓ Routes           5 pushed, all present
+✓ DNS servers      2 of 4 answer for tiznit.local — 10.10.10.111, 10.10.10.112
+✓ Resolves         tiznit.local: 10.10.10.111
+```
+
+The DNS servers are queried directly over UDP, around systemd-resolved, because
+"this server answers" and "the resolver is using this server" are different
+questions and only the second one is usually visible.
+
+## Warnings
 
 It warns about the failures that otherwise look like something else:
 
@@ -38,6 +57,11 @@ It warns about the failures that otherwise look like something else:
   so the tunnel negotiates, logs `Initialization Sequence Completed` and
   carries nothing while `nmcli` still calls it activated. Reconnect to fix it.
 - a tunnel that keeps restarting, as a count of reconnects in the last hour
+
+The log view also carries the bus denial behind that last one: neither
+NetworkManager nor OpenVPN reports it, so `l` includes `dbus-broker` /
+`dbus-daemon` lines about the VPN plugin, which is the only place the cause
+appears.
 
 `m` or `Space` opens a menu with every action, and `?` lists the keys.
 

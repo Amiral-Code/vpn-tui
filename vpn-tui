@@ -13,7 +13,7 @@ nmcli, so the bar widget and this TUI always agree about state.
 
 https://github.com/Amiral-Code/vpn-tui · MIT license
 """
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import collections
@@ -28,6 +28,8 @@ import os
 import queue
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -179,6 +181,92 @@ def resolved_current(iface):
         if "Current DNS Server:" in line:
             return line.split(":", 1)[1].split("#")[0].strip()
     return ""
+
+
+def dns_query(server, name, timeout=3):
+    """Ask one server for an A record over UDP. -> (ok, detail)
+
+    Deliberately goes around systemd-resolved: the useful question is whether
+    a server answers at all, which is separate from whether the resolver has
+    chosen to use it.
+    """
+    qname = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0"
+    pkt = struct.pack(">HHHHHH", 0x5650, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(pkt, (server, 53))
+        data, _ = sock.recvfrom(512)
+    except OSError as e:
+        return False, getattr(e, "strerror", None) or str(e) or "no reply"
+    finally:
+        sock.close()
+    if len(data) < 8:
+        return False, "short reply"
+    rcode, answers = data[3] & 0xF, struct.unpack(">H", data[6:8])[0]
+    if rcode == 0:
+        return (True, f"{answers} answer{'s' if answers != 1 else ''}") if answers \
+            else (False, "no records")
+    return False, {1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN",
+                   4: "NOTIMP", 5: "REFUSED"}.get(rcode, f"rcode {rcode}")
+
+
+def health_plan(c):
+    """Checks for a connected profile, as (label, run) pairs.
+
+    Each one measures something instead of reading a status field, because
+    every failure worth catching here reports "connected" in NetworkManager
+    while carrying nothing.
+    """
+    addr = c.info.get("IP4.ADDRESS[1]", "").split("/")[0]
+    domains = [v for k, v in c.info.items() if k.startswith("IP4.DOMAIN[")]
+    servers = [v for k, v in c.info.items() if k.startswith("IP4.DNS[")]
+    nets = []
+    for k, v in c.info.items():
+        if k.startswith("IP4.ROUTE["):
+            dst = parse_kv_list(v).get("dst", "")
+            if dst and dst != "0.0.0.0/0" and not dst.endswith("/32"):
+                nets.append(dst)
+    probe = domains[0] if domains else ""
+    plan = []
+
+    def interface():
+        if not addr:
+            return False, "NetworkManager reports no address"
+        got = iface_for(addr)
+        return (True, f"{got} holds {addr}") if got else \
+            (False, f"nothing holds {addr} — reconnect")
+    plan.append(("Interface", interface))
+
+    # No ping of the VPN gateway: a point-to-point peer commonly ignores ICMP,
+    # so a silent one proves nothing. Querying the pushed DNS servers reaches
+    # the far side for real and says something useful when it fails.
+    if nets:
+        def routes():
+            rc, out, _ = run(["ip", "-4", "route"], timeout=5)
+            missing = [x for x in nets if x not in (out or "")]
+            return not missing, (f"{len(nets)} pushed, all present" if not missing
+                                 else "missing " + " ".join(missing))
+        plan.append(("Routes", routes))
+
+    if probe and servers:
+        def dns_servers():
+            # One row for the whole list: a profile that pushes public
+            # resolvers as well will have some that cannot know this zone, and
+            # that is not a fault of the VPN.
+            good = [srv for srv in servers if dns_query(srv, probe)[0]]
+            detail = f"{len(good)} of {len(servers)} answer for {probe}"
+            return bool(good), detail + (f" — {', '.join(good)}" if good else "")
+        plan.append(("DNS servers", dns_servers))
+
+    if probe:
+        def resolves():
+            rc, out, err = run(["resolvectl", "query", probe], timeout=8)
+            line = ((out or err or "").strip().splitlines() or ["no answer"])[0]
+            return rc == 0, re.sub(r"\s+", " ", line.split(" -- link:")[0]).strip()
+        plan.append(("Resolves", resolves))
+
+    return plan
 
 
 def openvpn_pid(active_path):
@@ -363,6 +451,9 @@ def is_private_host(host):
 
 # ── journal ──────────────────────────────────────────────────────────────────
 
+# dbus-broker on most current systemd distros, dbus-daemon on older ones.
+DBUS_IDENTS = ("dbus-broker", "dbus-daemon")
+
 NM_PREFIX = re.compile(r"^<(\w+)>\s+\[[\d.]+\]\s+(?:vpn\[[^\]]*\]:\s*)?")
 OK_RE = re.compile(r"Initialization Sequence Completed|Peer Connection Initiated")
 ERR_RE = re.compile(r"AUTH_FAILED|\berror\b|failed|fatal|cannot|can't|refused|unreachable|timed? ?out", re.I)
@@ -402,6 +493,7 @@ class Logs:
             "Can't read the system journal. Add yourself to the systemd-journal group and log in again."
         self.pid_owner = {}
         self.pending = []
+        self.last_owner = None      # profile to file untagged lines under
 
     def ensure(self, uuids):
         uuids = frozenset(uuids)
@@ -416,6 +508,7 @@ class Logs:
             self.all.clear()
             self.pid_owner.clear()
             self.pending = []
+            self.last_owner = None
             self.version += 1
         args = ["journalctl", "-f", "-o", "json", "-n", "3000", "--no-pager",
                 "--output-fields=MESSAGE,SYSLOG_IDENTIFIER,_PID,NM_CONNECTION,_BOOT_ID"]
@@ -424,6 +517,11 @@ class Logs:
         if uuids:
             args.append("+")
         args.append("SYSLOG_IDENTIFIER=nm-openvpn")
+        # D-Bus refusing the openvpn helper's SetIp4Config leaves the tunnel
+        # negotiated but empty, and only the bus daemon records it. Which
+        # implementation is running differs by distro, so match both.
+        for ident in DBUS_IDENTS:
+            args += ["+", f"SYSLOG_IDENTIFIER={ident}"]
         try:
             self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          text=True, errors="replace")
@@ -464,7 +562,17 @@ class Logs:
             if key not in self.pid_owner:
                 self.pid_owner[key] = self._claim(pid, ts)
             owner = self.pid_owner[key]
+            if owner:
+                self.last_owner = owner
             entry = (ts, pid, classify(msg), msg)
+        elif e.get("SYSLOG_IDENTIFIER") in DBUS_IDENTS:
+            # Keep only the VPN plugin denials; everything else on the bus is
+            # noise here. They carry no NM_CONNECTION, so they are filed under
+            # whichever profile last spoke.
+            if "NetworkManager.VPN.Plugin" not in msg:
+                return
+            owner = self.last_owner
+            entry = (ts, 0, "err", "D-Bus: " + msg)
         else:
             owner = e.get("NM_CONNECTION")
             m = NM_PREFIX.match(msg)
@@ -984,8 +1092,8 @@ class App:
     def main_hints(self):
         c = self.current()
         toggle = "disconnect" if c and c.state in ("activated", "activating") else "connect"
-        return [("⏎", toggle), ("r", "reconnect"), ("l", "log"), ("e", "edit"), ("p", "password"),
-                ("i", "import"), ("m", "menu"), ("?", "help"), ("q", "quit")]
+        return [("⏎", toggle), ("r", "reconnect"), ("l", "log"), ("h", "health"), ("e", "edit"),
+                ("p", "password"), ("i", "import"), ("m", "menu"), ("?", "help"), ("q", "quit")]
 
     def draw_main(self, top, left, height, width):
         s = self.scr
@@ -1757,6 +1865,7 @@ class App:
             ("disconnect", "Disconnect", "d", on),
             ("reconnect", "Reconnect", "r", on),
             ("log", "View log", "l", has),
+            ("health", "Health check", "h", on),
             ("edit", "Edit settings…", "e", has),
             ("advanced", "Advanced editor (nmcli)…", "E", has),
             ("password", "Change username/password…", "p", has and c.uses_password),
@@ -1773,9 +1882,41 @@ class App:
         ]
         return self.menu(c.name if c else "OpenVPN", items)
 
+    def health(self, c):
+        """Probe the live tunnel and show what actually answers."""
+        if not c or not c.active:
+            return self.flash("Connect the profile first", "warn")
+        plan = health_plan(c)
+        rows = [[label, None, "…"] for label, _ in plan]
+        done = threading.Event()
+
+        def work():
+            for i, (_, fn) in enumerate(plan):
+                try:
+                    rows[i][1], rows[i][2] = fn()
+                except Exception as e:                        # a probe must never kill the UI
+                    rows[i][1], rows[i][2] = False, str(e)
+            done.set()
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def draw():
+            y, x, h, w = self.dialog_box(len(rows) + 5, 76, f"Health check · {c.name}")
+            for i, (label, ok, detail) in enumerate(rows):
+                mark, col = {None: ("·", C["dim"]), True: ("✓", C["ok"]),
+                             False: ("✗", C["err"])}[ok]
+                put(self.scr, y + 2 + i, x + 3, mark, col | curses.A_BOLD)
+                put(self.scr, y + 2 + i, x + 5, f"{label:<16}", C["bold"] if ok is not None else C["dim"])
+                put(self.scr, y + 2 + i, x + 22, detail, 0 if ok else col, w - 25)
+            put(self.scr, y + h - 2, x + 3,
+                "any key to close" if done.is_set() else "probing…", C["dim"])
+
+        self.modal(draw, lambda k: True)
+
     def help(self):
         keys = [("↑↓ j k", "select a profile"), ("⏎", "connect / disconnect (cancels while connecting)"),
                 ("c d r", "connect, disconnect, reconnect"), ("l", "full log for the profile"),
+                ("h", "health check: probe the address, routes and DNS"),
                 ("e", "edit name, server, tunnel, reconnect, login, proxy"),
                 ("E", "advanced editor (every NetworkManager setting)"),
                 ("p", "change username/password, then (re)connect"), ("x", "clear the saved password"),
@@ -1901,7 +2042,7 @@ class App:
         if k in (curses.KEY_END, "G"):
             return self.move(10 ** 6)
         action = {" ": "menu", "m": "menu", "q": "quit", ESC: "quit", "c": "connect", "d": "disconnect",
-                  "r": "reconnect", "l": "log", "e": "edit", "E": "advanced", "p": "password",
+                  "r": "reconnect", "l": "log", "h": "health", "e": "edit", "E": "advanced", "p": "password",
                   "x": "clear", "o": "export", "b": "bar", "D": "delete", curses.KEY_DC: "delete",
                   "i": "import", "u": "import_url", "s": "settings", "?": "help"}.get(k)
         if k in ENTER:
@@ -1918,7 +2059,7 @@ class App:
         if not action or not c:
             return None
         return {"toggle": self.toggle, "connect": self.connect, "disconnect": self.disconnect,
-                "reconnect": self.reconnect, "edit": self.edit, "advanced": self.advanced,
+                "reconnect": self.reconnect, "health": self.health, "edit": self.edit, "advanced": self.advanced,
                 "password": self.credentials, "clear": self.clear_password, "export": self.export,
                 "bar": self.set_bar, "delete": self.delete}[action](c)
 
