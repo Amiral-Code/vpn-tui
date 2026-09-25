@@ -162,6 +162,25 @@ def resolved_link(iface):
     return tail(dns), tail(dom)
 
 
+def resolved_current(iface):
+    """The one server systemd-resolved is actually querying on a link, or "".
+
+    It lists every server it was handed but answers from one of them. When a
+    VPN pushes public resolvers alongside its own, the public one can win, and
+    the VPN's private zone then returns NXDOMAIN with nothing else looking
+    wrong -- the servers are all "active", they are simply not the ones used.
+    """
+    if not iface or not shutil.which("resolvectl"):
+        return ""
+    rc, out, _ = run(["resolvectl", "status", iface], timeout=5)
+    if rc:
+        return ""
+    for line in out.splitlines():
+        if "Current DNS Server:" in line:
+            return line.split(":", 1)[1].split("#")[0].strip()
+    return ""
+
+
 def openvpn_pid(active_path):
     """PID of the openvpn process NM started for an active connection.
 
@@ -479,6 +498,11 @@ class Logs:
         with self.lock:
             return any(ts >= t0 and pattern in msg for ts, _, _, msg in self.by_uuid.get(uuid, ()))
 
+    def count(self, uuid, t0, pattern):
+        with self.lock:
+            return sum(1 for ts, _, _, msg in self.by_uuid.get(uuid, ())
+                       if ts >= t0 and pattern in msg)
+
     def connected_at(self, uuid, pid):
         with self.lock:
             for ts, p, _, msg in reversed(self.by_uuid.get(uuid, ())):
@@ -501,6 +525,8 @@ class Conn:
         self.rx_rate = self.tx_rate = 0.0
         self.sample_t = 0.0
         self.dns_live, self.dns_domains, self.dns_t = None, None, 0.0
+        self.dns_cur = ""
+        self.stall_since = 0.0      # when the address stopped matching any link
         self.pid = 0
         self.busy = ""              # set while this TUI runs an action on it
         self.last_op = 0.0
@@ -508,6 +534,17 @@ class Conn:
     @property
     def active(self):
         return self.state == "activated"
+
+    @property
+    def stalled(self):
+        """Activated per NetworkManager, yet no interface holds its address.
+
+        Happens when NetworkManager restarts under a running openvpn: D-Bus
+        then refuses the helper's SetConfig/SetIp4Config, so the tunnel
+        negotiates, logs "Initialization Sequence Completed" and carries
+        nothing, while nmcli keeps reporting it as activated.
+        """
+        return bool(self.stall_since) and time.time() - self.stall_since > 5
 
     @property
     def secrets(self):
@@ -604,6 +641,7 @@ class Model:
                 c.iface = c.iface_addr = ""
                 c.pid, c.sample_t, c.rx_rate, c.tx_rate = 0, 0.0, 0.0, 0.0
                 c.dns_live, c.dns_domains = None, None
+                c.dns_cur, c.stall_since = "", 0.0
         with self.lock:
             for u in list(self.conns):
                 if u not in seen:
@@ -631,8 +669,14 @@ class Model:
         if addr and addr != c.iface_addr:
             c.iface, c.iface_addr = iface_for(addr), addr
             c.sample_t, c.dns_t = 0.0, 0.0
+        elif addr and not c.iface:
+            c.iface = iface_for(addr)   # the link may still be on its way up
+        if not addr:
+            c.iface = ""
         if not c.iface:
+            c.stall_since = c.stall_since or now
             return
+        c.stall_since = 0.0
         rx, tx = read_counter(c.iface, "rx_bytes"), read_counter(c.iface, "tx_bytes")
         if c.sample_t:
             dt = max(now - c.sample_t, 0.001)
@@ -640,6 +684,7 @@ class Model:
         c.rx, c.tx, c.sample_t = rx, tx, now
         if now - c.dns_t > 5:
             c.dns_live, c.dns_domains = resolved_link(c.iface)
+            c.dns_cur = resolved_current(c.iface)
             c.dns_t = now
 
 
@@ -1026,7 +1071,15 @@ class App:
             since = since or (proc_start(c.pid) if c.pid else 0)
             extra = [(f"  for {human_duration(time.time() - since)}", 0),
                      (time.strftime("  since %H:%M", time.localtime(since)), dim)] if since else []
-            row("Status", ("● Connected", C["ok"] | curses.A_BOLD), *extra)
+            if c.stalled:
+                row("Status", ("● Connected", C["err"] | curses.A_BOLD),
+                    ("  ⚠ but no interface holds this address", C["err"]))
+                row("", ("the tunnel is carrying nothing — reconnect it", C["err"]))
+            else:
+                row("Status", ("● Connected", C["ok"] | curses.A_BOLD), *extra)
+            flaps = self.m.logs.count(c.uuid, time.time() - 3600, "ping-restart")
+            if flaps >= 2:
+                row("", (f"⚠ {flaps} reconnects in the last hour", C["warn"]))
         else:
             last = ago(int(c.info.get("connection.timestamp") or 0))
             row("Status", ("○ Disconnected", dim), (f"  · last connected {last}" if last else "", dim))
@@ -1073,13 +1126,26 @@ class App:
                 parts = [(" ".join(servers), 0)]
                 if domains:
                     parts.append((f"  for {' '.join(domains)}", dim))
+                # Only the VPN's own resolvers really matter. A split-DNS
+                # setup may deliberately drop the public ones it also pushes,
+                # which is a fix, not a fault, so don't report it as one.
+                wanted = [v for v in servers if is_private_host(v)] or servers
                 if c.dns_live is None:
                     pass  # no systemd-resolved to ask
-                elif set(servers) <= set(c.dns_live):
+                elif not c.dns_live:
+                    parts.append(("  ⚠ systemd-resolved has none on this link", C["err"]))
+                elif set(wanted) <= set(c.dns_live):
                     parts.append(("  ✓ active", C["ok"]))
                 elif c.iface and c.dns_t:
                     parts.append(("  ⚠ not applied by systemd-resolved", C["warn"]))
                 row("DNS", *parts)
+                # Listed and used are different things: with both private and
+                # public servers pushed, resolved may answer from the public
+                # one and the VPN's own zone comes back NXDOMAIN.
+                if c.dns_cur and not is_private_host(c.dns_cur) \
+                        and any(is_private_host(v) for v in servers):
+                    row("", (f"⚠ answering from {c.dns_cur}, not the VPN's servers",
+                             C["warn"]))
         else:
             never = c.info.get("ipv4.never-default") == "yes"
             row("Routing", ("Split tunnel, only the VPN's networks", 0) if never

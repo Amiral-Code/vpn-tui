@@ -23,9 +23,21 @@ uses only the standard library.
 | Settings | `s`: desktop notifications, and which profile a status-bar widget controls |
 | Tray balloon messages | Status line in the TUI, plus optional desktop notifications |
 
-It also exports profiles as `.ovpn` (`o`), deletes them (`D`), and warns about
-two common problems: a profile whose server is a private LAN address, and VPN
-DNS servers that systemd-resolved is not using.
+It also exports profiles as `.ovpn` (`o`) and deletes them (`D`).
+
+It warns about the failures that otherwise look like something else:
+
+- a profile whose server is a private LAN address
+- VPN DNS servers that systemd-resolved is not using, or a link it left with
+  no DNS at all
+- a public resolver answering for the VPN, when the profile pushes both public
+  and private servers: every server reads as active, yet the VPN's own zone
+  comes back NXDOMAIN
+- **connected, but no interface holds the address** — after NetworkManager is
+  restarted under a running openvpn, D-Bus refuses the helper's `SetIp4Config`,
+  so the tunnel negotiates, logs `Initialization Sequence Completed` and
+  carries nothing while `nmcli` still calls it activated. Reconnect to fix it.
+- a tunnel that keeps restarting, as a count of reconnects in the last hour
 
 `m` or `Space` opens a menu with every action, and `?` lists the keys.
 
