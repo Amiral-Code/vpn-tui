@@ -82,6 +82,23 @@ appears.
 </tr>
 </table>
 
+## Development
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+No dependencies and nothing to install. The tests come in two groups: the
+offline ones stand up their own DNS server on localhost or replace the
+module's `run()` with canned output, so they pass anywhere including CI, while
+the handful that need a live VPN skip themselves when there isn't one. Those
+live tests are the only thing that checks the code still agrees with real
+`nmcli`, `ip` and `resolvectl` output, so run them with a VPN up before
+releasing.
+
+`vpn-tui` has no `.py` extension, so the tests load it through
+`SourceFileLoader` rather than importing it.
+
 ## Requirements
 
 - Linux with **NetworkManager** and its **OpenVPN plugin**

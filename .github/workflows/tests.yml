@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.8 is the floor the README promises; it is no longer in the
+          # ubuntu-24.04 tool cache, so that job pins the older runner.
+          - {python-version: "3.8", os: ubuntu-22.04}
+          - {python-version: "3.13", os: ubuntu-latest}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Byte-compile
+        run: python -m py_compile vpn-tui
+      # NetworkManager is absent on the runner, so the tests that need a live
+      # VPN skip themselves and the offline ones carry the run.
+      - name: Tests
+        run: python -m unittest discover -s tests -v

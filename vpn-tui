@@ -183,6 +183,36 @@ def resolved_current(iface):
     return ""
 
 
+def dns_verdict(servers, live, checked=True):
+    """How a profile's DNS servers fared with systemd-resolved.
+
+    -> (state, text); state is "", "ok", "warn" or "err", and "" means say
+    nothing. Only the profile's own private resolvers need to be present: a
+    split-DNS setup may deliberately drop the public ones it also pushes, and
+    that is a fix rather than a fault.
+    """
+    if live is None:
+        return "", ""                       # no systemd-resolved to ask
+    if not live:
+        return "err", "systemd-resolved has none on this link"
+    wanted = [v for v in servers if is_private_host(v)] or servers
+    if set(wanted) <= set(live):
+        return "ok", "active"
+    return ("warn", "not applied by systemd-resolved") if checked else ("", "")
+
+
+def dns_hijacked(servers, current):
+    """True when a public resolver is answering for a profile that also pushes
+    private ones.
+
+    Listed and used are different things: systemd-resolved reports every server
+    it was handed but answers from one, so the VPN's own zone can return
+    NXDOMAIN while every indicator still reads fine.
+    """
+    return bool(current) and not is_private_host(current) \
+        and any(is_private_host(v) for v in servers)
+
+
 def dns_query(server, name, timeout=3):
     """Ask one server for an A record over UDP. -> (ok, detail)
 
@@ -1234,24 +1264,11 @@ class App:
                 parts = [(" ".join(servers), 0)]
                 if domains:
                     parts.append((f"  for {' '.join(domains)}", dim))
-                # Only the VPN's own resolvers really matter. A split-DNS
-                # setup may deliberately drop the public ones it also pushes,
-                # which is a fix, not a fault, so don't report it as one.
-                wanted = [v for v in servers if is_private_host(v)] or servers
-                if c.dns_live is None:
-                    pass  # no systemd-resolved to ask
-                elif not c.dns_live:
-                    parts.append(("  ⚠ systemd-resolved has none on this link", C["err"]))
-                elif set(wanted) <= set(c.dns_live):
-                    parts.append(("  ✓ active", C["ok"]))
-                elif c.iface and c.dns_t:
-                    parts.append(("  ⚠ not applied by systemd-resolved", C["warn"]))
+                state, text = dns_verdict(servers, c.dns_live, bool(c.iface and c.dns_t))
+                if state:
+                    parts.append((f"  {'✓' if state == 'ok' else '⚠'} {text}", C[state]))
                 row("DNS", *parts)
-                # Listed and used are different things: with both private and
-                # public servers pushed, resolved may answer from the public
-                # one and the VPN's own zone comes back NXDOMAIN.
-                if c.dns_cur and not is_private_host(c.dns_cur) \
-                        and any(is_private_host(v) for v in servers):
+                if dns_hijacked(servers, c.dns_cur):
                     row("", (f"⚠ answering from {c.dns_cur}, not the VPN's servers",
                              C["warn"]))
         else:
