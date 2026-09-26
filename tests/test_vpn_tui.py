@@ -384,6 +384,46 @@ class TestHealthPlan(unittest.TestCase):
         self.assertNotIn("Gateway", [label for label, _ in vt.health_plan(c)])
 
 
+class TestCliReconnect(unittest.TestCase):
+    """cli_reconnect drives nmcli; record the calls instead of making them."""
+
+    def setUp(self):
+        self.calls = []
+        saved = {k: getattr(vt, k) for k in ("resolve", "nmcli", "run", "notify", "load_config")}
+        self.addCleanup(lambda: [setattr(vt, k, v) for k, v in saved.items()])
+        vt.nmcli = lambda *a, **k: (self.calls.append(a), (0, "", ""))[1]
+        vt.run = lambda *a, **k: (self.calls.append(tuple(a[0])), (0, "", ""))[1]
+        vt.notify = lambda *a, **k: None
+        vt.load_config = lambda: {}
+
+    def profile(self, state):
+        vt.resolve = lambda t: {"uuid": "U1", "name": "vpn", "state": state}
+
+    def test_unknown_profile_fails(self):
+        vt.resolve = lambda t: None
+        self.assertEqual(vt.cli_reconnect("nope"), 1)
+        self.assertEqual(self.calls, [])
+
+    def test_disconnected_profile_is_left_alone(self):
+        self.profile("")
+        self.assertEqual(vt.cli_reconnect("vpn"), 0)
+        self.assertEqual(self.calls, [], "a deliberately down VPN must not be raised")
+
+    def test_active_profile_is_cycled_after_the_network_is_up(self):
+        self.profile("activated")
+        self.assertEqual(vt.cli_reconnect("vpn"), 0)
+        self.assertEqual(self.calls, [
+            ("connection", "down", "uuid", "U1"),
+            ("nm-online", "-q", "-t", "60"),      # wait before bringing it back
+            ("connection", "up", "uuid", "U1"),
+        ])
+
+    def test_failure_to_come_back_up_is_reported(self):
+        self.profile("activated")
+        vt.nmcli = lambda *a, **k: (0, "", "") if a[1] == "down" else (4, "", "boom")
+        self.assertEqual(vt.cli_reconnect("vpn"), 1)
+
+
 # ── live: needs a VPN up ────────────────────────────────────────────────────
 
 @unittest.skipUnless(vpn_up(), "no VPN connection is active")

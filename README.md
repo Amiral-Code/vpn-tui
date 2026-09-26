@@ -82,6 +82,23 @@ appears.
 </tr>
 </table>
 
+## Reconnecting after resume
+
+openvpn retries a second or two after the machine wakes, before Wi-Fi has
+associated, and reuses the endpoint address it cached before sleeping -- which
+is the wrong one if a dynamic DNS name moved meanwhile. The profile then sits
+"activated" in NetworkManager while the tunnel carries nothing, and the
+[warnings](#warnings) above will say so.
+
+`vpn-tui --reconnect NAME` waits for the network to come back and cycles the
+profile, leaving a genuinely disconnected one alone.
+`extras/systemd/vpn-tui-reconnect@.service` runs it on wake:
+
+```sh
+sudo cp 'extras/systemd/vpn-tui-reconnect@.service' /etc/systemd/system/
+sudo systemctl enable 'vpn-tui-reconnect@<profile-uuid>.service'
+```
+
 ## Development
 
 ```sh

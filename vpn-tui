@@ -2116,6 +2116,36 @@ def cli_connect(target):
     return 1
 
 
+def cli_reconnect(target):
+    """Force a profile down and back up, once the network is actually there.
+
+    Unlike --connect this does not trust NetworkManager's idea of the state.
+    After a suspend/resume the profile is routinely still "activated" while the
+    tunnel carries nothing: openvpn's --ping-restart fires a second or two
+    after wake, before Wi-Fi has associated, and retries the endpoint address
+    it cached before sleeping -- which is the wrong one if a dynamic DNS name
+    moved meanwhile. A profile that is genuinely down is left alone.
+    """
+    r = resolve(target)
+    if not r:
+        print(f"No VPN profile named '{target}'", file=sys.stderr)
+        return 1
+    if not r["state"]:
+        return 0                                   # deliberately disconnected
+    nmcli("connection", "down", "uuid", r["uuid"])
+    run(["nm-online", "-q", "-t", "60"], timeout=70)
+    rc, out, err = nmcli("connection", "up", "uuid", r["uuid"])
+    if rc == 0:
+        if load_config().get("notify"):
+            notify("VPN reconnected", r["name"])
+        return 0
+    msg = nm_error(out, err)
+    if load_config().get("notify"):
+        notify("VPN failed", f"{r['name']}: {msg}")
+    print(msg, file=sys.stderr)
+    return 1
+
+
 def cli_disconnect(target):
     r = resolve(target)
     if not r:
@@ -2149,6 +2179,8 @@ def tui(scr, args):
 def main():
     ap = argparse.ArgumentParser(description="Manage NetworkManager OpenVPN profiles.")
     ap.add_argument("--connect", metavar="NAME", help="connect a profile and exit")
+    ap.add_argument("--reconnect", metavar="NAME",
+                    help="force a connected profile down and up again, e.g. after resume")
     ap.add_argument("--disconnect", metavar="NAME", help="disconnect a profile and exit")
     ap.add_argument("--auth", metavar="NAME", help="open the TUI at the credentials prompt")
     ap.add_argument("--version", action="version", version=f"vpn-tui {__version__}")
@@ -2157,6 +2189,8 @@ def main():
         sys.exit("vpn-tui needs NetworkManager's nmcli")
     if args.connect:
         sys.exit(cli_connect(args.connect))
+    if args.reconnect:
+        sys.exit(cli_reconnect(args.reconnect))
     if args.disconnect:
         sys.exit(cli_disconnect(args.disconnect))
     if not sys.stdin.isatty():

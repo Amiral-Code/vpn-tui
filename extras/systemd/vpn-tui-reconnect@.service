@@ -1,0 +1,27 @@
+# Reconnect a VPN profile after the machine wakes up.
+#
+# openvpn's --ping-restart fires a second or two after resume, before Wi-Fi has
+# associated, and retries the endpoint address it cached before sleeping -- the
+# wrong one if a dynamic DNS name moved meanwhile. The tunnel then stays
+# "activated" in NetworkManager while carrying nothing. This waits for the
+# network to be back and cycles the profile; one that is genuinely
+# disconnected is left alone.
+#
+#   sudo cp 'vpn-tui-reconnect@.service' /etc/systemd/system/
+#   sudo systemctl enable 'vpn-tui-reconnect@<profile-uuid-or-name>.service'
+#
+# Use the UUID if the profile name contains spaces, or escape it with
+# systemd-escape. If vpn-tui was installed with install.sh rather than from a
+# package, change ExecStart to the full path, e.g. /home/you/.local/bin/vpn-tui.
+
+[Unit]
+Description=Reconnect %I after resume
+Documentation=https://github.com/Amiral-Code/vpn-tui
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/vpn-tui --reconnect %I
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
